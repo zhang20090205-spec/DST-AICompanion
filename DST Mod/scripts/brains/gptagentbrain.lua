@@ -77,6 +77,13 @@ local LOCAL_STOP_TEXT = {
 	["别动"] = true,
 }
 
+local LOCAL_FOLLOW_TEXT = {
+	follow = true,
+	["follow me"] = true,
+	come = true,
+	["come here"] = true,
+}
+
 local LOCAL_YES_TEXT = {
 	yes = true,
 	["是"] = true,
@@ -1223,6 +1230,16 @@ function GPTAgentBrain:QueueTextCommand(text, userid)
 		self.UttAction = "Stop"
 		self.Utterance = "stop"
 		self:SayAI("Stopping.")
+		return true
+	elseif LOCAL_FOLLOW_TEXT[normalized] then
+		if type(userid) == "string" and self.SetCommandLeader ~= nil then
+			self:SetCommandLeader(userid)
+		end
+		self:EnsurePlayerTarget(nil)
+		self:InterruptLocalAction("local player follow", true)
+		self.UttAction = "Follow"
+		self.Utterance = "follow"
+		self:SayAI("Following.")
 		return true
 	elseif LOCAL_YES_TEXT[normalized] then
 		return true

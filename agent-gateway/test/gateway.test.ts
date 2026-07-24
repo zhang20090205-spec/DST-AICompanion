@@ -388,6 +388,40 @@ test("a Gateway without an API key returns a clear local session error without a
   store.close();
 });
 
+test("Realtime session proxy returns sanitized OpenAI client-secret errors", async (t) => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    return new Response(JSON.stringify({
+      error: {
+        message: `Invalid safety identifier dst-${"a".repeat(60)} from Bearer sk_test_server_key and ek_test_secret at https://user:pass@example.test`,
+        code: "invalid_value",
+        param: "OpenAI-Safety-Identifier",
+      },
+    }), {
+      status: 400,
+      headers: { "Content-Type": "application/json" },
+    });
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const { store, core } = createCore();
+  const app = createGatewayApp({ ...config, apiKey: "sk_test_server_key" }, core);
+  const response = await app.inject({ method: "POST", url: "/api/realtime/session" });
+  const body = response.json() as { error?: string };
+  assert.equal(response.statusCode, 400);
+  assert.match(body.error ?? "", /OpenAI Realtime client-secret request failed \(400\):/);
+  assert.match(body.error ?? "", /invalid_value/);
+  assert.match(body.error ?? "", /param=OpenAI-Safety-Identifier/);
+  assert.equal(JSON.stringify(body).includes("sk_test_server_key"), false);
+  assert.equal(JSON.stringify(body).includes("ek_test_secret"), false);
+  assert.equal(JSON.stringify(body).includes("dst-" + "a".repeat(60)), false);
+  assert.equal(JSON.stringify(body).includes("user:pass"), false);
+  await app.close();
+  store.close();
+});
+
 test("sourced knowledge keeps its pinned MIT attribution and stays out of raw player memory", () => {
   const store = new GatewayStore(":memory:");
   const hits = store.searchKnowledge("winter survival combat", 1);
@@ -614,7 +648,8 @@ test("Realtime session proxy sends a stable hashed safety identifier without lea
   assert.equal(second.statusCode, 200);
   const firstSafetyIdentifier = new Headers(requests[0]?.init?.headers).get("OpenAI-Safety-Identifier");
   const secondSafetyIdentifier = new Headers(requests[1]?.init?.headers).get("OpenAI-Safety-Identifier");
-  assert.match(firstSafetyIdentifier ?? "", /^dst-[a-f0-9]{64}$/);
+  assert.match(firstSafetyIdentifier ?? "", /^dst-[a-f0-9]{60}$/);
+  assert.equal(firstSafetyIdentifier?.length, 64);
   assert.equal(secondSafetyIdentifier, firstSafetyIdentifier);
   assert.equal(JSON.stringify(requests).includes(rawUserId), false);
   assert.equal(JSON.stringify(first.json()).includes(rawUserId), false);

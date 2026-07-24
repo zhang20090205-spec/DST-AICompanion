@@ -188,10 +188,12 @@ export class GatewayCore {
     if (!userid) {
       return undefined;
     }
+    // OpenAI caps OpenAI-Safety-Identifier at 64 characters.
     const digest = createHash("sha256")
       .update("dst-ai-companion:openai-safety-identifier\0")
       .update(userid)
-      .digest("hex");
+      .digest("hex")
+      .slice(0, 60);
     return `dst-${digest}`;
   }
 

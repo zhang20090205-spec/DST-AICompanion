@@ -21,6 +21,16 @@ test("runtime uses GPT Agent brain while preserving the legacy FAtiMA brain file
 	assert.match(modmain, /local companion_count = math\.min\(1, math\.max\(0, requested_companion_count\)\)/);
 });
 
+test("only modmain accesses the mod GLOBAL table for its sandboxed tonumber", async () => {
+  const modmain = await readModFile("modmain.lua");
+  const legacy = await readModFile("scripts", "brains", "fatimabrain.lua");
+  const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
+
+  assert.match(modmain, /local tonumber = GLOBAL\.tonumber/);
+  assert.doesNotMatch(legacy, /GLOBAL\.tonumber/);
+  assert.doesNotMatch(gpt, /GLOBAL\.tonumber/);
+});
+
 test("GPT Agent brain speaks the locked gateway protocol", async () => {
   const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
 
@@ -150,6 +160,20 @@ test("Gateway failures interrupt local actions and leave the companion standing 
 	assert.match(gpt, /self:EnterGatewayStandby\("command poll failed"\)/);
 	assert.match(gpt, /self:EnterGatewayStandby\("result post failed"\)/);
 	assert.match(gpt, /self:EnterGatewayStandby\("player input forward failed"\)/);
+});
+
+test("GPT Agent handles simple follow chat commands locally", async () => {
+	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
+
+	assert.match(gpt, /local LOCAL_FOLLOW_TEXT =/);
+	assert.match(gpt, /follow = true/);
+	assert.match(gpt, /\["follow me"\] = true/);
+	assert.match(gpt, /elseif LOCAL_FOLLOW_TEXT\[normalized\] then/);
+	assert.match(gpt, /self:SetCommandLeader\(userid\)/);
+	assert.match(gpt, /self:EnsurePlayerTarget\(nil\)/);
+	assert.match(gpt, /self:InterruptLocalAction\("local player follow", true\)/);
+	assert.match(gpt, /self\.UttAction = "Follow"/);
+	assert.match(gpt, /self:SayAI\("Following\."\)/);
 });
 
 test("Lua revalidates rare gives and honors entity movement targets", async () => {

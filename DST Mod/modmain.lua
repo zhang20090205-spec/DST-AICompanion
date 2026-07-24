@@ -1,4 +1,5 @@
 local text_command_hook_wrapper = nil
+local tonumber = GLOBAL.tonumber
 
 local function GetCompanionConfig(name)
 	return GetModConfigData(name)
