@@ -119,9 +119,10 @@ test("disconnecting a player cannot leave a stale distance target", async () => 
 	assert.match(brain, /p1 ~= nil and p1:IsValid\(\) and p2 ~= nil and p2:IsValid\(\)/);
 });
 
-test("legacy graph-file opening is absent from executable source", async () => {
+test("GPT Live runtime removes legacy debug and graph code", async () => {
   const modmain = await readModFile("modmain.lua");
 
   assert.doesNotMatch(modmain, /io\.open\s*\(/);
-  assert.match(modmain, /legacy CSV graph exporter is disabled/);
+  assert.doesNotMatch(modmain, /CHEATS_ENABLED|DEBUG_MENU_ENABLED|debugkeys|debughelpers/);
+  assert.doesNotMatch(modmain, /fatimabrain|graph_data\.csv/);
 });

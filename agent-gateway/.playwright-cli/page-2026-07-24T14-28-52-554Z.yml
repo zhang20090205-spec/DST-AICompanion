@@ -1,0 +1,28 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e5]: DST AI Companion
+    - generic [ref=e8]: 未连接
+    - button "连接语音" [ref=e10] [cursor=pointer]
+  - region "游戏状态" [ref=e14]:
+    - generic [ref=e15]:
+      - generic [ref=e16]: 生命
+      - strong [ref=e17]: "--"
+    - generic [ref=e18]:
+      - generic [ref=e19]: 饥饿
+      - strong [ref=e20]: "--"
+    - generic [ref=e21]:
+      - generic [ref=e22]: 理智
+      - strong [ref=e23]: "--"
+    - generic [ref=e24]:
+      - generic [ref=e25]: 温度
+      - strong [ref=e26]: "--"
+    - generic [ref=e27]:
+      - generic [ref=e28]: 等待游戏状态
+      - generic [ref=e29]: 待命
+  - paragraph [ref=e31]: 等待对话
+  - generic [ref=e32]:
+    - textbox "发送文字" [ref=e33]:
+      - /placeholder: 输入给伙伴的话
+    - button "发送" [disabled] [ref=e34]
+    - button "立即停止伙伴动作" [disabled] [ref=e38]
+  - generic "动作记录" [ref=e42]: 动作记录为空

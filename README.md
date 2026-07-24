@@ -1,97 +1,98 @@
-# DST-AICompanion
+# DST AI Companion: GPT Live Agent
 
-`DST-AICompanion` is a server-side companion Mod for Don't Starve Together. It
-spawns a WX-78 companion, sends its perception data to the included FAtiMA
-server, and executes the server's decisions in the game world.
+This repository runs one local Don't Starve Together companion as a Chinese
+voice-and-text game agent. The old FAtiMA executable is retained only for
+historical compatibility. GPT Live mode does not use it.
 
-This repository originated as an academic prototype based on FAtiMA-DST. It has
-been updated locally for current DST dedicated-server restrictions.
+## What runs where
 
-## Local installation
+```text
+DST Mod (Lua) <--- localhost HTTP ---> Agent Gateway (Node.js)
+                                             |
+                                             +--- Browser voice companion <--- WebRTC ---> OpenAI Realtime
+```
 
-The editable repository and the installed Mod are kept in sync at:
+The Lua Mod reports a compact, untrusted game snapshot and polls typed commands.
+It never executes model-provided Lua. The Gateway validates every command, keeps
+an interrupt epoch, and stores only local preferences, task summaries, and action
+audits. Browser audio goes directly to OpenAI using a short-lived client secret;
+`OPENAI_API_KEY` remains in the local Gateway process.
 
-| Purpose | Local path |
+## Local paths
+
+| Purpose | Path |
 | --- | --- |
 | Editable source | `E:\advx饥荒\DST-AICompanion-source` |
 | Installed DST Mod | `D:\steam\steamapps\common\Don't Starve Together\mods\DST-AICompanion` |
-| FAtiMA server | `E:\advx饥荒\DST-AICompanion-source\FAtiMA-Server\FAtiMA-Server.exe` |
+| Gateway | `E:\advx饥荒\DST-AICompanion-source\agent-gateway` |
+| Retired legacy service | `E:\advx饥荒\DST-AICompanion-source\FAtiMA-Server\FAtiMA-Server.exe` |
 
-Start `FAtiMA-Server.exe`, then host or restart a world with **The AI Companion**
-enabled. The server must keep running while the companion is active. Use one
-companion first; the original AI state is largely global and has not been
-validated for multiple companions.
+## Start GPT Live mode
 
-## Player commands
+1. In `agent-gateway/.env`, set `OPENAI_API_KEY` to your OpenAI API key. This
+   file is ignored by Git. Optionally set `OPENAI_REALTIME_MODEL`,
+   `OPENAI_REALTIME_VOICE`, and `DST_GATEWAY_DATABASE`.
+2. Run `powershell -ExecutionPolicy Bypass -File .\scripts\Start-DST-GPT-Agent.ps1`
+   from this repository. The script builds the Gateway, stops only the identified
+   legacy FAtiMA process, confirms that port 8080 is free, then starts the local
+   Gateway on `127.0.0.1:8080`.
+3. Open `http://127.0.0.1:8080` in a browser, allow microphone access, and select
+   the voice connection button.
+4. Host or restart a local DST world with **The AI Companion** enabled.
 
-Text commands are enabled by default and work without any speech-recognition
-software. Only public, non-emote chat messages beginning with the configured
-prefix are handled; normal chat, whispers, and emotes remain unchanged.
+The Gateway intentionally fails closed: if it loses the voice session or game
+connection, it queues an immediate stop and the companion waits. It does not
+fall back to FAtiMA.
 
-Default prefix: `!ai`
+## In-game interaction
 
-| Command examples | Effect |
+The default chat prefix is `!ai`.
+
+| Input | Result |
 | --- | --- |
-| `!ai follow`, `!ai 跟我` | Follow the player who sent the command |
-| `!ai stop`, `!ai 停下` | Wait in place |
-| `!ai help`, `!ai 救我` | Approach the player |
-| `!ai attack`, `!ai 攻击` | Attack the player's current combat target |
-| `!ai home`, `!ai 回基地` | Return to the companion's home portal/camp |
-| `!ai explore`, `!ai 找资源` | Wander and explore |
-| `!ai give grass`, `!ai 给我石头` | Drop the requested resource when available |
-| `!ai resume`, `!ai 继续` | Clear the manual command and resume autonomous behavior |
+| `!ai 跟着我，附近有树就砍一棵` | Sends natural-language intent to the Gateway/Realtime session. |
+| `!ai stop` or `!ai 停下` | Stops immediately in Lua, then notifies the Gateway. |
+| `!ai yes` / `!ai no` | Accepts or rejects an active high-risk confirmation. |
+| Browser microphone | Chinese VAD interaction; player speech interrupts the current reply and game action. |
 
-The Mod options can disable text commands or change the prefix to `/ai`.
-The companion acknowledges recognized commands in a speech bubble. Unknown
-commands do not change its behavior.
+The companion can speak in a bubble and emits `[AI]` messages into DST chat. Its
+allowed actions are follow, stop, approach/retreat, nearby ordinary gathering,
+nearby hostile defense, equip/eat, give ordinary items, and speak. Building,
+crafting, long-range exploration, attacking non-hostile targets, and rare-item
+consumption require confirmation.
 
-## Feature status
+## Safety contract
 
-| Feature | Status | Notes |
-| --- | --- | --- |
-| Spawn and autonomous FAtiMA control | Available | WX-78 sends perceptions to `localhost:8080` and executes decisions. |
-| World perception and HTTP decision loop | Available | Perception, decision, action-end, property-change, and delete events are implemented. |
-| Resource work and survival actions | Available when selected by FAtiMA | The Mod contains pickup, chop, mine, hammer, dig, craft, eat, combat, and item-drop paths. |
-| Personality options | Available | `Adventurer`, `Camper`, `Supporter`, and `None` are configurable. |
-| Player text interaction | Available | Added here through the protected `Networking_Say` server hook. |
-| Voice interaction from the upstream README | Not bundled | It requires a separate `Speech System`; upstream does not include it. `Enable Speech` stays off by default. |
-| Graph CSV export | Disabled | Current DST servers reject arbitrary Mod file writes, which previously crashed the server. |
-| Stuck recovery | Available | The brain resets itself after repeated no-progress checks. `Ctrl+R` remains a manual recovery option. |
-| Multiple companions | Not validated | The original brain shares global state; use one companion. |
+- Gateway binds only to `127.0.0.1`.
+- Commands contain `id`, `epoch`, `priority`, `kind`, `args`, and `expiresAt`.
+  `interrupt > player > autonomy`; stale epochs and expired commands are ignored.
+- The Mod and Gateway both validate entity IDs, distances, command kinds, and
+  text length.
+- Raw audio and persistent transcripts are not stored. Local SQLite contains
+  only explicit memory values, task/audit metadata, and attributed knowledge.
+- The bundled Markdown knowledge package is derived from the MIT-licensed
+  `morandot/dont-starve-skill` at pinned commit
+  `12dc27d3b6d0a261f0fbd14a046d492cba8c6e27`. Its source marker and full MIT
+  notice live under `agent-gateway/knowledge/`.
 
-## Important compatibility fixes
-
-- The screen spam `服务器 UttAction: None` was an unconditional debug message
-  emitted every perception tick, not a server error. It has been removed.
-- The legacy graph exporter no longer opens files in the Mod directory, avoiding
-  current DST's `invalid filepath` failure.
-- Follower/leader access is guarded so the companion can start before a player
-  has been assigned.
-
-## Configuration
-
-| Option | Default | Purpose |
-| --- | --- | --- |
-| Number of characters | 1 | Number of WX-78 companions to spawn. One is recommended. |
-| Personality | None | Selects the FAtiMA personality profile. |
-| Enable Text Commands | ON | Enables public-chat command handling. |
-| Chat Prefix | `!ai` | Command prefix, selectable as `!ai` or `/ai`. |
-| Enable Speech | OFF | Requires the unavailable external Speech System. |
-| Enable Showing Graph | OFF | Retained for compatibility; CSV output is disabled. |
-
-## Validation
-
-Run the regression checks from the editable source directory:
+## Verification
 
 ```powershell
 cd E:\advx饥荒\DST-AICompanion-source
 npm test
+
+cd .\agent-gateway
+npm test
+npm run typecheck
+npm run build
 ```
 
-The checks validate the Lua source structure without adding dependencies. Full
-game behavior still requires an active DST server and the FAtiMA executable.
+Manual game checks: issue `!ai stop` during a movement action, speak while the
+companion is responding, verify the action ends by the next poll, and confirm no
+Lua errors are reported in the DST log.
 
-## Upstream
+## Upstream references
 
-- Original repository: <https://github.com/votus777/DST-AICompanion>
-- FAtiMA toolkit: <https://github.com/GAIPS/FAtiMA-Toolkit>
+- Original Mod: <https://github.com/votus777/DST-AICompanion>
+- OpenAI Realtime WebRTC: <https://developers.openai.com/api/docs/guides/realtime-webrtc>
+- OpenAI Realtime conversations: <https://developers.openai.com/api/docs/guides/realtime-conversations>

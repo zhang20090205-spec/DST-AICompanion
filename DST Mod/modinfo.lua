@@ -1,8 +1,8 @@
 -- This information tells other players more about the mod
 name = "The AI Companion"
-description = "Play the game with AI\nDon't forget you need to run the companion console application!, orgin by Hineios \n\nGet it from:\n https://github.com/hineios/FAtiMA-DST/releases"
+description = "Local GPT Live companion for Don't Starve Together.\nRun the local Agent Gateway before hosting a world."
 author = "Han"
-version = "1.6"
+version = "2.0"
 --version_compatible = "1.7"
 
 -- This is the URL name of the mod's thread on the forum; the part after the index.php? and before the first & in the URL
@@ -37,12 +37,11 @@ server_filter_tags = {"ai"}
      {
          name = 'fatima-character-num',
          label = 'Number of characters',
-		 hover = 'The number of characters that will be added to the game.',
+		 hover = 'GPT Live mode supports one local companion.',
          options = 
          {
              {description = "0 characters", data = 0},
 			 {description = "1 character", data = 1},
-			 {description = "2 characters", data = 2},
              
          },
          default = 1,
@@ -118,6 +117,16 @@ server_filter_tags = {"ai"}
 			{description = "/ai", data = "/ai"},
 		},
 		default = "!ai",
+	},
+	{
+		name = "GPT Gateway URL",
+		label = "GPT Gateway URL",
+		hover = "Loopback HTTP endpoint for the local DST GPT Agent Gateway.",
+		options =
+		{
+			{description = "127.0.0.1:8080", data = "http://127.0.0.1:8080"},
+		},
+		default = "http://127.0.0.1:8080",
 	},
 	{
          name = 'OPE',

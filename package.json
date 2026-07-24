@@ -2,6 +2,6 @@
   "name": "dst-ai-companion-local",
   "private": true,
   "scripts": {
-    "test": "node --test"
+    "test": "node --test tests/dst-ai-companion.test.mjs \"DST Mod/tests/gptagentbrain-static.test.mjs\""
   }
 }
