@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { AudioLines, Check, CircleAlert, CircleStop, LoaderCircle, Mic, MicOff, Send, X } from "lucide-react";
 import { type ConnectionStatus, type GatewayEvent, type TranscriptEntry, RealtimeBridge } from "./realtime";
@@ -18,6 +18,15 @@ interface Confirmation {
   id: string;
   prompt?: string;
   expiresAt?: number;
+}
+
+interface GatewayHealthCompanion {
+  id?: string;
+  confirmation?: Confirmation | null;
+}
+
+interface GatewayHealth {
+  companions?: GatewayHealthCompanion[];
 }
 
 const STATUS_LABEL: Record<ConnectionStatus, string> = {
@@ -41,6 +50,32 @@ function App() {
 
   const addAudit = (entry: string) => setAudit((current) => [entry, ...current].slice(0, 8));
   const addTranscript = (entry: TranscriptEntry) => setTranscript((current) => [...current, entry].slice(-30));
+
+  useEffect(() => {
+    let disposed = false;
+    const refreshGatewaySnapshot = async () => {
+      try {
+        const response = await fetch("/api/health");
+        if (!response.ok || disposed) {
+          return;
+        }
+        const health = await response.json() as GatewayHealth;
+        const companion = health.companions?.find((candidate) => candidate.id === "default");
+        if (!disposed) {
+          setConfirmation(companion?.confirmation ?? null);
+        }
+      } catch {
+        // A local health refresh must never tear down the active voice session.
+      }
+    };
+
+    void refreshGatewaySnapshot();
+    const interval = window.setInterval(() => void refreshGatewaySnapshot(), 2_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
+  }, []);
 
   const handleGatewayEvent = (event: GatewayEvent) => {
     if (event.type === "game-state") {
@@ -70,8 +105,6 @@ function App() {
     } else if (event.type === "command" || event.type === "command-result" || event.type === "interrupt") {
       const kind = typeof event.data.kind === "string" ? event.data.kind : event.type;
       addAudit(kind);
-    } else if (event.type === "assistant-transcript" && typeof event.data.text === "string") {
-      addTranscript({ id: crypto.randomUUID(), role: "assistant", text: event.data.text });
     }
   };
 
@@ -112,6 +145,31 @@ function App() {
     }
   };
 
+  const answerConfirmation = async (answer: "是" | "否") => {
+    if (bridge.current) {
+      try {
+        await bridge.current.sendBrowserConfirmationAnswer(answer);
+      } catch (error) {
+        setDetail(error instanceof Error ? error.message : "确认发送失败。");
+        setStatus("error");
+      }
+      return;
+    }
+    try {
+      const response = await fetch("/api/dst/v1/companions/default/player-input", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id: crypto.randomUUID(), source: "browser", text: answer }),
+      });
+      if (!response.ok) {
+        throw new Error("Confirmation was not accepted.");
+      }
+      setConfirmation(null);
+    } catch (error) {
+      setDetail(error instanceof Error ? error.message : "确认发送失败。");
+    }
+  };
+
   return (
     <main className="app-shell">
       <header className="topbar">
@@ -139,8 +197,8 @@ function App() {
       {confirmation && <section className="confirmation">
         <CircleAlert size={18} /><span>{confirmation.prompt}</span>
         <div className="confirmation-actions">
-          <button type="button" title="确认" onClick={() => void submit("是")}><Check size={16} /></button>
-          <button type="button" title="取消" onClick={() => void submit("否")}><X size={16} /></button>
+          <button type="button" title="确认" onClick={() => void answerConfirmation("是")}><Check size={16} /></button>
+          <button type="button" title="取消" onClick={() => void answerConfirmation("否")}><X size={16} /></button>
         </div>
       </section>}
 

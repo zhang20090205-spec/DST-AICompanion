@@ -31,7 +31,9 @@ audits. Browser audio goes directly to OpenAI using a short-lived client secret;
 
 1. In `agent-gateway/.env`, set `OPENAI_API_KEY` to your OpenAI API key. This
    file is ignored by Git. Optionally set `OPENAI_REALTIME_MODEL`,
-   `OPENAI_REALTIME_VOICE`, and `DST_GATEWAY_DATABASE`.
+   `OPENAI_REALTIME_REASONING_EFFORT` (`medium` by default; use `high` only when
+   additional response latency is acceptable), `OPENAI_REALTIME_VOICE`, and
+   `DST_GATEWAY_DATABASE`.
 2. Run `powershell -ExecutionPolicy Bypass -File .\scripts\Start-DST-GPT-Agent.ps1`
    from this repository. The script builds the Gateway, stops only the identified
    legacy FAtiMA process, confirms that port 8080 is free, then starts the local

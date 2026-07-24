@@ -11,6 +11,7 @@ const config: GatewayConfig = {
   host: "127.0.0.1",
   port: 8080,
   realtimeModel: "gpt-realtime-2.1",
+  realtimeReasoningEffort: "medium",
   realtimeVoice: "marin",
   databasePath: ":memory:",
 };
@@ -103,11 +104,24 @@ test("player requests interrupt autonomy and command epochs prevent stale execut
 test("queued player commands outrank queued autonomy and remove stale autonomy", () => {
   const { store, core } = createCore();
   core.receiveState("bot-1", fixtureState());
-  core.enqueue("bot-1", "equip_or_eat", { action: "eat", itemName: "berries" }, "autonomy");
+  const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+  core.subscribe((event) => events.push(event));
+  const autonomy = core.enqueue("bot-1", "equip_or_eat", { action: "eat", itemName: "berries" }, "autonomy");
   const player = core.enqueue("bot-1", "follow_player", {}, "player");
   const command = core.pollCommands("bot-1").commands[0]!;
   assert.equal(command.id, player.id);
   assert.equal(command.priority, "player");
+  assert.equal(core.commandStatus("bot-1", autonomy.id)?.status, "cancelled");
+  const cancellation = events.find((event) => {
+    const result = event.data.result as { id?: string } | undefined;
+    return event.type === "command-result" && result?.id === autonomy.id;
+  });
+  const result = cancellation?.data.result as { status?: string; reason?: string } | undefined;
+  const lifecycle = cancellation?.data.lifecycle as { status?: string; terminal?: boolean } | undefined;
+  assert.equal(result?.status, "cancelled");
+  assert.equal(result?.reason, "player_override");
+  assert.equal(lifecycle?.status, "cancelled");
+  assert.equal(lifecycle?.terminal, true);
   core.receiveResult("bot-1", { id: command.id, status: "succeeded", stateRevision: 1 });
   assert.equal(core.pollCommands("bot-1").commands.length, 0);
   store.close();
@@ -128,12 +142,23 @@ test("active command results after TTL are ignored", () => {
   withFakeNow(1_000_000, (clock) => {
     const { store, core } = createCore();
     core.receiveState("bot-1", fixtureState());
+    const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+    core.subscribe((event) => events.push(event));
     const command = core.enqueue("bot-1", "follow_player", {}, "player");
     assert.equal(core.pollCommands("bot-1").commands[0]?.id, command.id);
     clock.set(command.expiresAt + 1);
     assert.deepEqual(core.receiveResult("bot-1", { id: command.id, status: "succeeded", stateRevision: 1 }), { accepted: false, duplicate: true });
     assert.equal(core.pollCommands("bot-1").commands.length, 0);
     assert.equal(store.recentAudit().some((entry) => entry.event === "command_expired" && entry.metadata.id === command.id), true);
+    const cancellation = events.find((event) => {
+      const result = event.data.result as { id?: string } | undefined;
+      return event.type === "command-result" && result?.id === command.id;
+    });
+    const result = cancellation?.data.result as { status?: string; reason?: string } | undefined;
+    const lifecycle = cancellation?.data.lifecycle as { status?: string; terminal?: boolean } | undefined;
+    assert.equal(result?.status, "cancelled");
+    assert.equal(result?.reason, "command expired");
+    assert.equal(lifecycle?.terminal, true);
     store.close();
   });
 });
@@ -345,6 +370,28 @@ test("HTTP contract exposes state, commands, results, and natural language input
   store.close();
 });
 
+test("health snapshot exposes safe pending confirmation data for reconnect reconciliation", async () => {
+  const { store, core } = createCore();
+  const app = createGatewayApp(config, core);
+  core.receiveState("bot-1", fixtureState());
+  const confirmation = core.requestConfirmation("bot-1", "attack_nearby_threat", { targetGuid: 102 }, "确认攻击这只牛吗？");
+
+  const health = await app.inject({ method: "GET", url: "/api/health" });
+  assert.equal(health.statusCode, 200);
+  const companion = (health.json().companions as Array<{
+    id?: string;
+    confirmation?: { id?: string; prompt?: string; expiresAt?: number; kind?: string };
+  }>).find((entry) => entry.id === "bot-1");
+  assert.equal(companion?.confirmation?.id, confirmation.id);
+  assert.equal(companion?.confirmation?.prompt, "确认攻击这只牛吗？");
+  assert.equal(companion?.confirmation?.expiresAt, confirmation.expiresAt);
+  assert.equal(companion?.confirmation?.kind, "attack_nearby_threat");
+  assert.equal(JSON.stringify(health.json()).includes("private voice transcript"), false);
+
+  await app.close();
+  store.close();
+});
+
 test("HTTP results reject malformed payloads and complete the active command exactly once", async () => {
   const { store, core } = createCore();
   const app = createGatewayApp(config, core);
@@ -422,7 +469,7 @@ test("Realtime session proxy returns sanitized OpenAI client-secret errors", asy
   store.close();
 });
 
-test("sourced knowledge keeps its pinned MIT attribution and stays out of raw player memory", () => {
+test("sourced knowledge keeps its pinned MIT attribution and stays out of raw player memory", async () => {
   const store = new GatewayStore(":memory:");
   const hits = store.searchKnowledge("winter survival combat", 1);
   assert.equal(hits.length, 1);
@@ -433,7 +480,7 @@ test("sourced knowledge keeps its pinned MIT attribution and stays out of raw pl
   const core = new GatewayCore(store);
   core.receiveState("bot-1", fixtureState());
   core.receivePlayerInput("bot-1", { text: "private voice transcript", source: "voice" });
-  const state = core.handleRealtimeTool("bot-1", "get_game_state", {});
+  const state = await core.handleRealtimeTool("bot-1", "get_game_state", {});
   assert.equal(JSON.stringify(state).includes("private voice transcript"), false);
   store.close();
 });
@@ -459,6 +506,95 @@ test("command lifecycle persists only structured goal and outcome summaries", ()
     kind: "follow_player",
     status: "succeeded",
   }));
+  store.close();
+});
+
+test("interrupts mark active and queued commands as cancelled terminal lifecycles", () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+  const active = core.enqueue("bot-1", "gather_nearby", { mode: "chop", targetGuid: 100 }, "player");
+  assert.equal(core.pollCommands("bot-1").commands[0]?.id, active.id);
+  const queued = core.enqueue("bot-1", "follow_player", {}, "player");
+  const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+  core.subscribe((event) => events.push(event));
+
+  const interrupt = core.interrupt("bot-1", "voice_vad");
+  assert.equal(interrupt.kind, "clear_action_queue");
+  assert.equal(core.commandStatus("bot-1", active.id)?.status, "cancelled");
+  assert.equal(core.commandStatus("bot-1", queued.id)?.status, "cancelled");
+  assert.equal(core.commandStatus("bot-1", active.id)?.terminal, true);
+  const cancelledIds = events
+    .filter((event) => event.type === "command-result")
+    .map((event) => event.data.result as { id?: string; status?: string; reason?: string })
+    .filter((result) => result.status === "cancelled" && result.reason === "voice_vad")
+    .map((result) => result.id);
+  assert.equal(cancelledIds.length, 2);
+  assert.equal(cancelledIds.includes(active.id), true);
+  assert.equal(cancelledIds.includes(queued.id), true);
+
+  assert.deepEqual(core.receiveResult("bot-1", { id: active.id, status: "succeeded", stateRevision: 1 }), { accepted: false, duplicate: true });
+  assert.equal(core.commandStatus("bot-1", active.id)?.status, "cancelled");
+  store.close();
+});
+
+test("Realtime tool calls can wait for Lua terminal command results", async () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+
+  const toolCall = core.handleRealtimeTool("bot-1", "follow_player", {}, "call-follow-wait");
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  const command = core.pollCommands("bot-1").commands[0]!;
+  assert.equal(command.kind, "follow_player");
+  assert.deepEqual(core.receiveResult("bot-1", { id: command.id, status: "started", stateRevision: 1 }), { accepted: true, duplicate: false });
+  assert.deepEqual(core.receiveResult("bot-1", { id: command.id, status: "succeeded", stateRevision: 2 }), { accepted: true, duplicate: false });
+
+  const { output } = await toolCall;
+  const typedOutput = output as {
+    commandId?: string;
+    status?: string;
+    terminal?: boolean;
+    pending?: boolean;
+    lifecycle?: { result?: { status?: string; stateRevision?: number } };
+  };
+  assert.equal(typedOutput.commandId, command.id);
+  assert.equal(typedOutput.status, "succeeded");
+  assert.equal(typedOutput.terminal, true);
+  assert.equal(typedOutput.pending, false);
+  assert.equal(typedOutput.lifecycle?.result?.status, "succeeded");
+  assert.equal(typedOutput.lifecycle?.result?.stateRevision, 2);
+
+  store.close();
+});
+
+test("Realtime command status and wait endpoints expose terminal lifecycle snapshots", async () => {
+  const { store, core } = createCore();
+  const app = createGatewayApp(config, core);
+  const session = core.registerBrowserSession();
+  core.receiveState("bot-1", fixtureState());
+  const command = core.enqueue("bot-1", "follow_player", {}, "player");
+
+  const queued = await app.inject({
+    method: "GET",
+    url: `/api/realtime/commands/${encodeURIComponent(command.id)}/status?sessionId=${encodeURIComponent(session.sessionId)}&companionId=bot-1`,
+  });
+  assert.equal(queued.statusCode, 200);
+  assert.equal(queued.json().command.status, "queued");
+
+  const wait = app.inject({
+    method: "GET",
+    url: `/api/realtime/commands/${encodeURIComponent(command.id)}/wait?sessionId=${encodeURIComponent(session.sessionId)}&companionId=bot-1&timeoutMs=1000`,
+  }).then((response) => response);
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(core.pollCommands("bot-1").commands[0]?.id, command.id);
+  core.receiveResult("bot-1", { id: command.id, status: "failed", reason: "target invalid", stateRevision: 3 });
+
+  const completed = await wait;
+  assert.equal(completed.statusCode, 200);
+  assert.equal(completed.json().command.status, "failed");
+  assert.equal(completed.json().command.terminal, true);
+  assert.equal(completed.json().command.result.reason, "target invalid");
+
+  await app.close();
   store.close();
 });
 
@@ -569,20 +705,25 @@ test("Realtime nonordinary give requests confirmation and ordinary items remain 
 	store.close();
 });
 
-test("assistant audio transcripts are mirrored to a rate-limited in-game say command", () => {
+test("raw assistant transcripts cannot enqueue in-game speech", async () => {
 	const { store, core } = createCore();
-	const first = core.receiveAssistantTranscript("bot-1", "我在这里。\n");
-	assert.equal(first.accepted, true);
-	assert.equal(first.duplicate, false);
-	assert.equal(first.command?.kind, "say_in_game");
-	assert.deepEqual(first.command?.args, { text: "我在这里。" });
-	assert.equal(core.pollCommands("bot-1").commands[0]?.id, first.command?.id);
-	assert.deepEqual(core.receiveResult("bot-1", { id: first.command!.id, status: "succeeded", stateRevision: 1 }), { accepted: true, duplicate: false });
+	const app = createGatewayApp(config, core);
+	const session = core.registerBrowserSession();
 
-	const duplicate = core.receiveAssistantTranscript("bot-1", "我在这里。");
-	assert.equal(duplicate.duplicate, true);
+	const response = await app.inject({
+		method: "POST",
+		url: "/api/realtime/events",
+		payload: {
+			sessionId: session.sessionId,
+			companionId: "bot-1",
+			type: "assistant-transcript",
+			text: "我去处理一下。",
+		},
+	});
+
+	assert.equal(response.statusCode, 400);
 	assert.equal(core.pollCommands("bot-1").commands.length, 0);
-	assert.equal(JSON.stringify(store.recentAudit()).includes("我在这里"), false);
+	await app.close();
 	store.close();
 });
 
@@ -618,7 +759,7 @@ test("Realtime client-secret proxy uses the server key without returning it", as
   assert.deepEqual(requestBody.expires_after, { anchor: "created_at", seconds: 600 });
   assert.equal(requestBody.session?.type, "realtime");
   assert.equal(requestBody.session?.model, config.realtimeModel);
-  assert.equal(requestBody.session?.reasoning?.effort, "low");
+  assert.equal(requestBody.session?.reasoning?.effort, "medium");
   assert.equal(requestBody.session?.audio?.input?.turn_detection?.type, "server_vad");
   assert.equal(requestBody.session?.audio?.input?.turn_detection?.interrupt_response, true);
 });

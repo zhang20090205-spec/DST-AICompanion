@@ -41,7 +41,7 @@ export async function createRealtimeClientSecret(
       session: {
         type: "realtime",
         model: config.realtimeModel,
-        reasoning: { effort: "low" },
+        reasoning: { effort: config.realtimeReasoningEffort },
         audio: {
           input: {
             turn_detection: {

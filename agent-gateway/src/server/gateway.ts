@@ -4,6 +4,7 @@ import type {
   CommandKind,
   CommandPriority,
   CommandResult,
+  CommandStatus,
   CompanionState,
   PendingConfirmation,
   PlayerInput,
@@ -26,10 +27,27 @@ export interface GatewayEvent {
   data: Record<string, unknown>;
 }
 
+type CommandLifecycleStatus = "queued" | "dispatched" | CommandStatus;
+
 interface CommandRecord {
   command: Command;
   queuedAt: number;
   started?: boolean;
+}
+
+interface CommandLifecycleRecord {
+  command: Command;
+  status: CommandLifecycleStatus;
+  queuedAt: number;
+  dispatchedAt?: number;
+  startedAt?: number;
+  completedAt?: number;
+  result?: CommandResult;
+}
+
+interface CommandWaiter {
+  resolve: (record: CommandLifecycleRecord) => void;
+  timer: ReturnType<typeof setTimeout>;
 }
 
 interface CompanionContext {
@@ -38,6 +56,8 @@ interface CompanionContext {
   state?: CompanionState;
   queue: CommandRecord[];
   active?: CommandRecord;
+  commandLifecycles: Map<string, CommandLifecycleRecord>;
+  commandWaiters: Map<string, Set<CommandWaiter>>;
   confirmation?: PendingConfirmation;
   voiceConnected: boolean;
   voiceSpeaking: boolean;
@@ -111,6 +131,9 @@ const ORDINARY_TRANSFER_PREFABS = new Set([
 
 const ASSISTANT_SPEECH_RATE_LIMIT_MS = 750;
 const ASSISTANT_SPEECH_DUPLICATE_WINDOW_MS = 10_000;
+const COMMAND_LIFECYCLE_RETENTION_MS = 5 * 60_000;
+const REALTIME_TOOL_RESULT_WAIT_MS = 1_200;
+const MAX_COMMAND_WAIT_MS = 10_000;
 
 const REALTIME_TOOLS = new Set([
   "get_game_state",
@@ -211,6 +234,7 @@ export class GatewayCore {
       return { epoch: context.epoch, commands: [] };
     }
     context.active = next;
+    this.updateCommandLifecycle(context, next.command, "dispatched");
     this.store.addAudit(companionId, "command_dispatched", {
       id: next.command.id,
       kind: next.command.kind,
@@ -238,6 +262,7 @@ export class GatewayCore {
         return { accepted: true, duplicate: true };
       }
       active.started = true;
+      this.updateCommandLifecycle(context, active.command, "started", result);
     }
     this.store.addAudit(companionId, `command_${result.status}`, {
       id: result.id,
@@ -246,6 +271,7 @@ export class GatewayCore {
       stateRevision: result.stateRevision,
     });
     if (result.status !== "started") {
+      this.updateCommandLifecycle(context, active.command, result.status, result);
       context.active = undefined;
       this.store.setCompanionMemory(companionId, "current_goal", JSON.stringify({ state: "idle" }));
       this.store.setCompanionMemory(companionId, "task_summary", JSON.stringify({
@@ -255,10 +281,47 @@ export class GatewayCore {
       this.publish({
         type: "command-result",
         companionId,
-        data: { result, kind: active.command.kind },
+        data: { result, kind: active.command.kind, lifecycle: this.publicCommandLifecycle(context.commandLifecycles.get(result.id)) },
       });
     }
     return { accepted: true, duplicate: false };
+  }
+
+  commandStatus(companionId: string, commandId: string): Record<string, unknown> | null {
+    const context = this.context(companionId);
+    this.expire(context);
+    return this.publicCommandLifecycle(context.commandLifecycles.get(commandId));
+  }
+
+  async waitForCommandTerminal(
+    companionId: string,
+    commandId: string,
+    timeoutMs = MAX_COMMAND_WAIT_MS,
+  ): Promise<Record<string, unknown> | null> {
+    const context = this.context(companionId);
+    this.expire(context);
+    const existing = context.commandLifecycles.get(commandId);
+    if (!existing || this.isTerminalCommandStatus(existing.status) || timeoutMs <= 0) {
+      return this.publicCommandLifecycle(existing);
+    }
+
+    const boundedTimeout = Math.max(1, Math.min(MAX_COMMAND_WAIT_MS, Math.floor(timeoutMs)));
+    const record = await new Promise<CommandLifecycleRecord>((resolve) => {
+      const waiter: CommandWaiter = {
+        resolve,
+        timer: setTimeout(() => {
+          context.commandWaiters.get(commandId)?.delete(waiter);
+          resolve(context.commandLifecycles.get(commandId) ?? existing);
+        }, boundedTimeout),
+      };
+      let waiters = context.commandWaiters.get(commandId);
+      if (!waiters) {
+        waiters = new Set<CommandWaiter>();
+        context.commandWaiters.set(commandId, waiters);
+      }
+      waiters.add(waiter);
+    });
+    return this.publicCommandLifecycle(record);
   }
 
   receivePlayerInput(companionId: string, input: PlayerInput): { action: string; confirmation?: string } {
@@ -296,14 +359,6 @@ export class GatewayCore {
     // Transcript text is intentionally only sent to live SSE subscribers, never persisted.
     this.publish({ type: "player-input", companionId, data: { text: normalized, source: input.source, userid: input.userid ?? null } });
     return { action: "forwarded" };
-  }
-
-  receiveAssistantTranscript(companionId: string, rawText: unknown): { accepted: boolean; duplicate: boolean; command?: Command } {
-    const text = sanitizeChat(rawText);
-    const context = this.context(companionId);
-    const command = this.enqueueAssistantSpeech(context, text);
-    this.publish({ type: "assistant-transcript", companionId, data: { text } });
-    return { accepted: true, duplicate: command === undefined, ...(command ? { command } : {}) };
   }
 
   setVoiceState(companionId: string, active: boolean): void {
@@ -350,6 +405,19 @@ export class GatewayCore {
 
   interrupt(companionId: string, reason: string): Command {
     const context = this.context(companionId);
+    const now = Date.now();
+    const safeReason = reason.slice(0, 80);
+    for (const record of context.queue) {
+      this.cancelCommandRecord(context, record, safeReason);
+    }
+    if (context.active) {
+      this.cancelCommandRecord(context, context.active, safeReason);
+    }
+    if (context.confirmation) {
+      const confirmation = context.confirmation;
+      this.store.addAudit(companionId, "confirmation_cancelled", { id: confirmation.id, reason: safeReason });
+      this.publish({ type: "confirmation", companionId, data: { id: confirmation.id, accepted: false, cancelled: true, reason: safeReason } });
+    }
     context.epoch += 1;
     context.queue = [];
     context.active = undefined;
@@ -359,10 +427,12 @@ export class GatewayCore {
       epoch: context.epoch,
       priority: "interrupt",
       kind: "clear_action_queue",
-      args: { reason: reason.slice(0, 80) },
-      expiresAt: boundedExpiry(Date.now(), 5_000, "clear_action_queue"),
+      args: { reason: safeReason },
+      expiresAt: boundedExpiry(now, 5_000, "clear_action_queue"),
     };
-    context.queue.push({ command, queuedAt: Date.now() });
+    const record = { command, queuedAt: now };
+    context.queue.push(record);
+    this.rememberCommandLifecycle(context, record);
     this.store.addAudit(companionId, "interrupted", { reason, epoch: context.epoch });
     this.publish({ type: "interrupt", companionId, data: { reason, epoch: context.epoch } });
     return command;
@@ -379,13 +449,22 @@ export class GatewayCore {
     }
 
     if (priority === "player") {
-      context.queue = context.queue.filter((record) => record.command.priority !== "autonomy");
+      const retainedQueue: CommandRecord[] = [];
+      for (const record of context.queue) {
+        if (record.command.priority === "autonomy") {
+          this.cancelCommandRecord(context, record, "player_override");
+        } else {
+          retainedQueue.push(record);
+        }
+      }
+      context.queue = retainedQueue;
     }
     const activeWeight = context.active ? PRIORITY_WEIGHT[context.active.command.priority] : 0;
     if (priority === "player" && activeWeight < PRIORITY_WEIGHT.player && context.active) {
       this.interrupt(companionId, "player_override");
     }
     const current = this.context(companionId);
+    const now = Date.now();
     const commandArgs = confirmed ? { ...args, confirmed: true } : args;
     const command: Command = {
       id: randomUUID(),
@@ -393,9 +472,11 @@ export class GatewayCore {
       priority,
       kind,
       args: commandArgs,
-      expiresAt: boundedExpiry(Date.now(), undefined, kind),
+      expiresAt: boundedExpiry(now, undefined, kind),
     };
-    current.queue.push({ command, queuedAt: Date.now() });
+    const record = { command, queuedAt: now };
+    current.queue.push(record);
+    this.rememberCommandLifecycle(current, record);
     this.store.setCompanionMemory(companionId, "current_goal", JSON.stringify({
       kind: command.kind,
       state: "queued",
@@ -431,7 +512,7 @@ export class GatewayCore {
     name: unknown,
     rawArgs: unknown,
     idempotenceKey?: string,
-  ): { output: Record<string, unknown>; command?: Command } {
+  ): Promise<{ output: Record<string, unknown>; command?: Command }> {
     if (typeof name !== "string" || !REALTIME_TOOLS.has(name)) {
       throw new ValidationError("Realtime attempted an unapproved tool.");
     }
@@ -443,27 +524,28 @@ export class GatewayCore {
       if (cached.name !== name || cached.argsFingerprint !== argsFingerprint) {
         throw new ValidationError("Realtime tool call id was reused with different arguments.");
       }
-      return { output: cached.output, command: cached.command };
+      return Promise.resolve({ output: this.withCurrentCommandLifecycle(companionId, cached.output, cached.command), command: cached.command });
     }
 
-    const result = this.runRealtimeTool(companionId, name, rawArgs);
-    if (cacheKey) {
-      this.realtimeToolResults.set(cacheKey, {
-        name,
-        argsFingerprint,
-        output: result.output,
-        command: result.command,
-        expiresAt: Date.now() + TOOL_CALL_CACHE_TTL_MS,
-      });
-    }
-    return result;
+    return this.runRealtimeTool(companionId, name, rawArgs).then((result) => {
+      if (cacheKey) {
+        this.realtimeToolResults.set(cacheKey, {
+          name,
+          argsFingerprint,
+          output: result.output,
+          command: result.command,
+          expiresAt: Date.now() + TOOL_CALL_CACHE_TTL_MS,
+        });
+      }
+      return result;
+    });
   }
 
-  private runRealtimeTool(
+  private async runRealtimeTool(
     companionId: string,
     name: string,
     rawArgs: unknown,
-  ): { output: Record<string, unknown>; command?: Command } {
+  ): Promise<{ output: Record<string, unknown>; command?: Command }> {
     const context = this.context(companionId);
     if (name === "get_game_state") {
       return {
@@ -519,10 +601,13 @@ export class GatewayCore {
       if (!command) {
         return { output: { accepted: true, duplicate: true } };
       }
-      return { output: { accepted: true, commandId: command.id, epoch: command.epoch }, command };
+      return { output: this.realtimeCommandOutput(companionId, command, false), command };
     }
     const command = this.enqueue(companionId, kind, args, "player");
-    return { output: { accepted: true, commandId: command.id, epoch: command.epoch }, command };
+    if (context.state && Date.now() - context.state.receivedAt <= 5_000) {
+      await this.waitForCommandTerminal(companionId, command.id, REALTIME_TOOL_RESULT_WAIT_MS);
+    }
+    return { output: this.realtimeCommandOutput(companionId, command), command };
   }
 
   runAutonomy(now = Date.now()): void {
@@ -588,7 +673,16 @@ export class GatewayCore {
         voiceActive: context.voiceSpeaking,
         voiceConnected: context.voiceConnected,
         voiceOfflineStandby: context.voiceOfflineStandby,
-        confirmation: context.confirmation ? { id: context.confirmation.id, expiresAt: context.confirmation.expiresAt } : null,
+        confirmation: context.confirmation ? {
+          id: context.confirmation.id,
+          prompt: context.confirmation.prompt,
+          expiresAt: context.confirmation.expiresAt,
+          kind: context.confirmation.command.kind,
+        } : null,
+        activeCommand: context.active ? this.publicCommandLifecycle(context.commandLifecycles.get(context.active.command.id)) : null,
+        queuedCommands: context.queue.slice(0, 8).map((record) =>
+          this.publicCommandLifecycle(context.commandLifecycles.get(record.command.id)),
+        ).filter((record): record is Record<string, unknown> => Boolean(record)),
       })),
       audit: this.store.recentAudit(12),
     };
@@ -604,6 +698,8 @@ export class GatewayCore {
         id,
         epoch: 0,
         queue: [],
+        commandLifecycles: new Map<string, CommandLifecycleRecord>(),
+        commandWaiters: new Map<string, Set<CommandWaiter>>(),
         voiceConnected: false,
         voiceSpeaking: false,
         voiceOfflineStandby: true,
@@ -616,9 +712,19 @@ export class GatewayCore {
   }
 
   private expire(context: CompanionContext, now = Date.now()): void {
-    context.queue = context.queue.filter((record) => record.command.expiresAt > now);
+    const freshQueue: CommandRecord[] = [];
+    for (const record of context.queue) {
+      if (record.command.expiresAt > now) {
+        freshQueue.push(record);
+      } else {
+        this.store.addAudit(context.id, "command_expired", { id: record.command.id, kind: record.command.kind });
+        this.cancelCommandRecord(context, record, "command expired");
+      }
+    }
+    context.queue = freshQueue;
     if (context.active && context.active.command.expiresAt <= now) {
       this.store.addAudit(context.id, "command_expired", { id: context.active.command.id, kind: context.active.command.kind });
+      this.cancelCommandRecord(context, context.active, "command expired");
       context.active = undefined;
     }
     if (context.confirmation && context.confirmation.expiresAt <= now) {
@@ -626,6 +732,156 @@ export class GatewayCore {
       this.publish({ type: "confirmation", companionId: context.id, data: { id: context.confirmation.id, expired: true } });
       context.confirmation = undefined;
     }
+    for (const [id, record] of context.commandLifecycles) {
+      if (this.isTerminalCommandStatus(record.status) && (record.completedAt ?? record.queuedAt) + COMMAND_LIFECYCLE_RETENTION_MS <= now) {
+        context.commandLifecycles.delete(id);
+      }
+    }
+  }
+
+  private rememberCommandLifecycle(context: CompanionContext, record: CommandRecord): void {
+    context.commandLifecycles.set(record.command.id, {
+      command: record.command,
+      status: "queued",
+      queuedAt: record.queuedAt,
+    });
+    this.publishCommandLifecycle(context, record.command.id);
+  }
+
+  private updateCommandLifecycle(
+    context: CompanionContext,
+    command: Command,
+    status: CommandLifecycleStatus,
+    result?: CommandResult,
+  ): void {
+    const now = Date.now();
+    let record = context.commandLifecycles.get(command.id);
+    if (!record) {
+      record = { command, status: "queued", queuedAt: now };
+      context.commandLifecycles.set(command.id, record);
+    }
+    if (this.isTerminalCommandStatus(record.status)) {
+      return;
+    }
+
+    record.status = status;
+    if (status === "dispatched") {
+      record.dispatchedAt = record.dispatchedAt ?? now;
+    } else if (status === "started") {
+      record.startedAt = record.startedAt ?? now;
+    } else if (this.isTerminalCommandStatus(status)) {
+      record.completedAt = now;
+    }
+    if (result) {
+      record.result = result;
+    }
+    this.publishCommandLifecycle(context, command.id);
+    if (this.isTerminalCommandStatus(status)) {
+      this.resolveCommandWaiters(context, command.id, record);
+    }
+  }
+
+  private cancelCommandRecord(context: CompanionContext, record: CommandRecord, reason: string): void {
+    const existing = context.commandLifecycles.get(record.command.id);
+    if (existing && this.isTerminalCommandStatus(existing.status)) {
+      return;
+    }
+    const result: CommandResult = {
+      id: record.command.id,
+      status: "cancelled",
+      reason,
+      stateRevision: context.state?.revision ?? 0,
+    };
+    this.store.addAudit(context.id, "command_cancelled", {
+      id: record.command.id,
+      kind: record.command.kind,
+      reason,
+    });
+    this.updateCommandLifecycle(context, record.command, "cancelled", result);
+    this.publish({
+      type: "command-result",
+      companionId: context.id,
+      data: { result, kind: record.command.kind, lifecycle: this.publicCommandLifecycle(context.commandLifecycles.get(record.command.id)) },
+    });
+  }
+
+  private publishCommandLifecycle(context: CompanionContext, commandId: string): void {
+    const lifecycle = this.publicCommandLifecycle(context.commandLifecycles.get(commandId));
+    if (lifecycle) {
+      this.publish({ type: "command-lifecycle", companionId: context.id, data: lifecycle });
+    }
+  }
+
+  private resolveCommandWaiters(context: CompanionContext, commandId: string, record: CommandLifecycleRecord): void {
+    const waiters = context.commandWaiters.get(commandId);
+    if (!waiters) {
+      return;
+    }
+    context.commandWaiters.delete(commandId);
+    for (const waiter of waiters) {
+      clearTimeout(waiter.timer);
+      waiter.resolve(record);
+    }
+  }
+
+  private publicCommandLifecycle(record: CommandLifecycleRecord | undefined): Record<string, unknown> | null {
+    if (!record) {
+      return null;
+    }
+    return {
+      id: record.command.id,
+      kind: record.command.kind,
+      epoch: record.command.epoch,
+      priority: record.command.priority,
+      status: record.status,
+      terminal: this.isTerminalCommandStatus(record.status),
+      queuedAt: record.queuedAt,
+      dispatchedAt: record.dispatchedAt ?? null,
+      startedAt: record.startedAt ?? null,
+      completedAt: record.completedAt ?? null,
+      result: record.result ?? null,
+    };
+  }
+
+  private realtimeCommandOutput(companionId: string, command: Command, terminalWaitAllowed = true): Record<string, unknown> {
+    const lifecycle = this.commandStatus(companionId, command.id);
+    const status = typeof lifecycle?.status === "string" ? lifecycle.status : "queued";
+    const terminal = lifecycle?.terminal === true;
+    return {
+      accepted: true,
+      commandId: command.id,
+      kind: command.kind,
+      epoch: command.epoch,
+      status,
+      terminal,
+      lifecycle,
+      result: lifecycle?.result ?? null,
+      pending: !terminal,
+      ...(terminal
+        ? {}
+        : {
+            waitRecommended: terminalWaitAllowed,
+            instruction: "The DST action is not complete yet. Do not tell the player it succeeded until a terminal command lifecycle reports succeeded.",
+          }),
+    };
+  }
+
+  private withCurrentCommandLifecycle(
+    companionId: string,
+    output: Record<string, unknown>,
+    command: Command | undefined,
+  ): Record<string, unknown> {
+    if (!command) {
+      return output;
+    }
+    return {
+      ...output,
+      ...this.realtimeCommandOutput(companionId, command),
+    };
+  }
+
+  private isTerminalCommandStatus(status: CommandLifecycleStatus): status is "succeeded" | "failed" | "cancelled" {
+    return status === "succeeded" || status === "failed" || status === "cancelled";
   }
 
   private requiresConfirmation(kind: CommandKind, args: Record<string, unknown>, state: CompanionState | undefined): boolean {

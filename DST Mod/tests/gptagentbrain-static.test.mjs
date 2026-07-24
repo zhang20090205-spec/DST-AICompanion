@@ -188,3 +188,33 @@ test("Lua revalidates rare gives and honors entity movement targets", async () =
 	assert.match(gpt, /"GPTApproach"/);
 	assert.match(gpt, /"GPTRetreat"/);
 });
+
+test("gather commands report started before execution and wait for buffered completion", async () => {
+	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
+
+	assert.match(
+		gpt,
+		/self:ReportCommandResult\(command\.id, "started"\)\s+local waits_for_action, apply_reason = self:ApplyCommand\(command\)\s+if waits_for_action == nil then\s+self:CompleteActiveCommand\("failed", apply_reason or "command could not be applied"\)\s+elseif waits_for_action == false then\s+self:CompleteActiveCommand\("succeeded"\)\s+end/m,
+	);
+	assert.match(
+		gpt,
+		/function GPTAgentBrain:ApplyGatherCommand\(command\)[\s\S]*?self:SetCurrentCommandAction\(command, action, target, nil, nil\)\s+return true\s+end/,
+	);
+	assert.match(gpt, /buffered:AddSuccessAction\(function\(\)[\s\S]*?self:FinishBufferedCommand\("succeeded"\)\s+end\)/);
+	assert.match(gpt, /buffered:AddFailAction\(function\(\)[\s\S]*?self:FinishBufferedCommand\("failed", "buffered action failed"\)\s+end\)/);
+});
+
+test("active command cancellation is reported for replacement expiry and local interrupts", async () => {
+	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
+
+	assert.match(gpt, /self:CompleteActiveCommand\("cancelled", "replaced by newer command"\)/);
+	assert.match(
+		gpt,
+		/function GPTAgentBrain:InterruptLocalAction\(reason, report_active\)\s+if report_active and self\.ActiveCommand ~= nil then\s+self:CompleteActiveCommand\("cancelled", SafeText\(reason, MAX_RESULT_REASON\)\)\s+end/,
+	);
+	assert.match(
+		gpt,
+		/function GPTAgentBrain:ExpireActiveCommand\(\)\s+if self\.ActiveCommand ~= nil and IsFiniteNumber\(self\.ActiveCommand\.expiresAt\) and self\.ActiveCommand\.expiresAt <= NowMs\(\) then\s+self:InterruptLocalAction\("command expired", true\)\s+end\s+end/,
+	);
+	assert.match(gpt, /self:CompleteActiveCommand\("cancelled", "action cleared"\)/);
+});

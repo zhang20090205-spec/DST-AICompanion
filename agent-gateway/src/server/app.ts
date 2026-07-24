@@ -12,6 +12,16 @@ interface CompanionParams {
   id: string;
 }
 
+interface RealtimeCommandParams {
+  id: string;
+}
+
+interface RealtimeCommandQuery {
+  sessionId?: string;
+  companionId?: string;
+  timeoutMs?: string;
+}
+
 interface RealtimeEventBody {
   sessionId?: string;
   companionId?: string;
@@ -119,7 +129,7 @@ export function createGatewayApp(config: GatewayConfig, core: GatewayCore): Fast
       if (typeof body.callId !== "string" || body.callId.length > 128) {
         throw new ValidationError("Realtime function call is missing callId.");
       }
-      const result = core.handleRealtimeTool(companionId, body.name, parseToolArguments(body.arguments), body.callId);
+      const result = await core.handleRealtimeTool(companionId, body.name, parseToolArguments(body.arguments), body.callId);
       return { callId: body.callId, output: JSON.stringify(result.output) };
     }
     if (body.type === "transcript") {
@@ -127,14 +137,6 @@ export function createGatewayApp(config: GatewayConfig, core: GatewayCore): Fast
         throw new ValidationError("Transcript text is required.");
       }
       return core.receivePlayerInput(companionId, { text: body.text, source: "voice" });
-    }
-    if (body.type === "assistant-transcript") {
-      if (typeof body.text !== "string") {
-        throw new ValidationError("Assistant transcript text is required.");
-      }
-      // The transcript stays session-local, but its sanitized text is mirrored
-      // into one rate-limited Lua say command so browser voice and DST chat match.
-      return core.receiveAssistantTranscript(companionId, body.text);
     }
     if (body.type === "interrupt") {
       const command = core.interrupt(companionId, "voice_vad");
@@ -153,6 +155,27 @@ export function createGatewayApp(config: GatewayConfig, core: GatewayCore): Fast
       return { accepted: true };
     }
     throw new ValidationError("Unsupported Realtime browser event.");
+  });
+
+  app.get<{ Params: RealtimeCommandParams; Querystring: RealtimeCommandQuery }>("/api/realtime/commands/:id/status", async (request) => {
+    core.assertBrowserSession(request.query.sessionId);
+    const companionId = typeof request.query.companionId === "string" ? request.query.companionId : "default";
+    const lifecycle = core.commandStatus(companionId, request.params.id);
+    if (!lifecycle) {
+      throw new ValidationError("Unknown command id.");
+    }
+    return { command: lifecycle };
+  });
+
+  app.get<{ Params: RealtimeCommandParams; Querystring: RealtimeCommandQuery }>("/api/realtime/commands/:id/wait", async (request) => {
+    core.assertBrowserSession(request.query.sessionId);
+    const companionId = typeof request.query.companionId === "string" ? request.query.companionId : "default";
+    const timeoutMs = typeof request.query.timeoutMs === "string" ? Number.parseInt(request.query.timeoutMs, 10) : undefined;
+    const lifecycle = await core.waitForCommandTerminal(companionId, request.params.id, Number.isFinite(timeoutMs) ? timeoutMs : undefined);
+    if (!lifecycle) {
+      throw new ValidationError("Unknown command id.");
+    }
+    return { command: lifecycle };
   });
 
   app.post<{ Body: { sessionId?: string; companionId?: string } }>("/api/interrupt", async (request) => {
