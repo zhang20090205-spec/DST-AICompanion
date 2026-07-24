@@ -16,6 +16,64 @@ local header = ""
 local dt = nil
 
 local ArtificalWalterEnabled = false
+local text_command_hook_wrapper = nil
+
+local function GetCompanionConfig(name)
+	return GetModConfigData(name)
+end
+
+local function FindCompanionBrain()
+	for _, entity in pairs(GLOBAL.Ents or {}) do
+		if entity ~= nil and entity:IsValid() and entity:HasTag("FAtiMA-Brain") then
+			local brain = entity.brain
+			if brain ~= nil and brain.QueueTextCommand ~= nil then
+				return brain
+			end
+		end
+	end
+end
+
+local function HandleTextCommand(userid, message, whisper, isemote)
+	if GetCompanionConfig("Enable Text Commands") ~= 1
+		or whisper == true or isemote == true or type(message) ~= "string" then
+		return
+	end
+
+	local prefix = GetCompanionConfig("Chat Prefix") or "!ai"
+	if string.sub(string.lower(message), 1, #prefix) ~= string.lower(prefix) then
+		return
+	end
+
+	local command = string.gsub(string.sub(message, #prefix + 1), "^%s*(.-)%s*$", "%1")
+	if command == "" then
+		return
+	end
+
+	local brain = FindCompanionBrain()
+	if brain ~= nil then
+		brain:QueueTextCommand(command, userid)
+	end
+end
+
+local function InstallTextCommandHook()
+	if not GLOBAL.TheWorld.ismastersim or type(GLOBAL.Networking_Say) ~= "function" then
+		return
+	end
+
+	if text_command_hook_wrapper == GLOBAL.Networking_Say then
+		return
+	elseif text_command_hook_wrapper ~= nil then
+		print("[DST AI Companion] Networking_Say was replaced; text commands are disabled.")
+		return
+	end
+
+	local original_networking_say = GLOBAL.Networking_Say
+	text_command_hook_wrapper = function(guid, userid, name, prefab, message, colour, whisper, isemote, user_vanity)
+		original_networking_say(guid, userid, name, prefab, message, colour, whisper, isemote, user_vanity)
+		HandleTextCommand(userid, message, whisper, isemote)
+	end
+	GLOBAL.Networking_Say = text_command_hook_wrapper
+end
 
 local function SetSelfAI()
 	local brain = GLOBAL.require "brains/fatimabrain"
@@ -142,10 +200,14 @@ end
 
 AddSimPostInit(function ()
 
-	if GLOBAL.TheWorld.ismastersim and GetModConfigData('fatima-character-num') > 0 then 
-
+	if GLOBAL.TheWorld.ismastersim and GetModConfigData('fatima-character-num') > 0 then
+		InstallTextCommandHook()
 		-- Find the Portal
 		local portal = FindPortal()
+		if portal == nil then
+			print("[DST AI Companion] No multiplayer portal was found; companion spawn was skipped.")
+			return
+		end
 
 		-- Spawn the characters required in the mod config
 		local i = 0
@@ -168,8 +230,8 @@ AddSimPostInit(function ()
 end)
 
 AddGamePostInit(function() -- just called the func once
-	-- The old graph exporter used io.open(MODROOT .. "graph_data.csv"), which
-	-- current dedicated servers reject as an invalid filepath.
+	-- The legacy CSV graph exporter is disabled because current dedicated servers
+	-- reject arbitrary Mod file writes.
 end
 )
 

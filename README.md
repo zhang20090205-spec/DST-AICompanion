@@ -1,92 +1,97 @@
 # DST-AICompanion
-Play "Don't Starve Together" with an interactive AI agent
 
-**This mod has been developed for an academic research purpose - Master's thesis.**  
-**Title : "Exploring Factors Influencing Human Behavior of AI Personality in a Virtual Collaboration Environment"**
+`DST-AICompanion` is a server-side companion Mod for Don't Starve Together. It
+spawns a WX-78 companion, sends its perception data to the included FAtiMA
+server, and executes the server's decisions in the game world.
 
-Mod for the Steam game [Don't Starve Together](https://store.steampowered.com/app/322330/Dont_Starve_Together/)
-, based on [FAtiMA-Toolkit](https://github.com/GAIPS/FAtiMA-Toolkit) to add an AI Agent to play and cooperate with players in the DST game world. This source code makes the agent able to move and do various actions autonomously. The agent can pick up resources, chop down trees, and even fight enemies with you.
+This repository originated as an academic prototype based on FAtiMA-DST. It has
+been updated locally for current DST dedicated-server restrictions.
 
-The skeleton of the original mod is 'FAtiMA DST', built by [Hineios](https://github.com/hineios/FAtiMA-DST). However, while DST is updated, that mod is no longer updated by the developer. So this mod added advanced features and fixed major issues. In particular, the AI was given a personality, allowing it to display different characteristics. You can see the recorded test video [here](https://youtu.be/C9GPoEb9D_c?si=GKqpptaeVf8IrStb)
+## Local installation
 
-<p align="center">
-	<img src = "https://github.com/votus777/DST-AICompanion/assets/51744036/94102a04-e56c-4132-af0b-23206e90a6f0"></img>
-</p>
-	
+The editable repository and the installed Mod are kept in sync at:
 
-## Requirements
--   Window OS 
--   Steam version of ‘Don’t Starve Together’
+| Purpose | Local path |
+| --- | --- |
+| Editable source | `E:\advx饥荒\DST-AICompanion-source` |
+| Installed DST Mod | `D:\steam\steamapps\common\Don't Starve Together\mods\DST-AICompanion` |
+| FAtiMA server | `E:\advx饥荒\DST-AICompanion-source\FAtiMA-Server\FAtiMA-Server.exe` |
 
+Start `FAtiMA-Server.exe`, then host or restart a world with **The AI Companion**
+enabled. The server must keep running while the companion is active. Use one
+companion first; the original AI state is largely global and has not been
+validated for multiple companions.
 
-## Installation 
+## Player commands
 
-To run this mode, it needs mainly two components.   
-One is the *FAtiMA Server file*, and the other is the *DST mod file* that applies in the Steam game folder. 
+Text commands are enabled by default and work without any speech-recognition
+software. Only public, non-emote chat messages beginning with the configured
+prefix are handled; normal chat, whispers, and emotes remain unchanged.
 
-- FatiMA Server: This is the brain of the Agent. It will determine what the agent should do based on perception data and send orders to the mod file. It's a C# console application (**FAtiMA-Server.exe**) and will be run from outside of the game independently. 
+Default prefix: `!ai`
 
-- DST Mod: This is a body of agents. It will transfer the data that the Agent perceived in the DST game environments to the FAtiMA server. Also when it receives orders, the mod file proceeds so the Agent can perform actual actions. 
+| Command examples | Effect |
+| --- | --- |
+| `!ai follow`, `!ai 跟我` | Follow the player who sent the command |
+| `!ai stop`, `!ai 停下` | Wait in place |
+| `!ai help`, `!ai 救我` | Approach the player |
+| `!ai attack`, `!ai 攻击` | Attack the player's current combat target |
+| `!ai home`, `!ai 回基地` | Return to the companion's home portal/camp |
+| `!ai explore`, `!ai 找资源` | Wander and explore |
+| `!ai give grass`, `!ai 给我石头` | Drop the requested resource when available |
+| `!ai resume`, `!ai 继续` | Clear the manual command and resume autonomous behavior |
 
-___ 
+The Mod options can disable text commands or change the prefix to `/ai`.
+The companion acknowledges recognized commands in a speech bubble. Unknown
+commands do not change its behavior.
 
-1. The DST mod should be pasted into the game folder. (C:\\Program Files (x86)\\Steam\\steamapps\\common\\Don't Starve Together\\mods)
+## Feature status
 
-2. Start DST vis Steam and create a new world.   
-	2-1. Click ‘Host Game’ from the main screen.   
-	2-2. Create New World   
-	2-3. Select ‘Survival’    
-	2-4. Check ‘Friends Only’  
-	2-5. If you look at the tab above, you can see that there is ‘Mod (0)’  
-	2-6. Check the boxes of ‘HRI_Gamemod’ & ‘The AI Companion’ to enable the mods.   
-	2-7. Select ‘The AI Companion’ mod and click to check mod options.  
-	2-8. Click ‘Generate World’ on the right below side.   
-	2-9. MUST SELECT ‘Wilson’ character from the select window.   
+| Feature | Status | Notes |
+| --- | --- | --- |
+| Spawn and autonomous FAtiMA control | Available | WX-78 sends perceptions to `localhost:8080` and executes decisions. |
+| World perception and HTTP decision loop | Available | Perception, decision, action-end, property-change, and delete events are implemented. |
+| Resource work and survival actions | Available when selected by FAtiMA | The Mod contains pickup, chop, mine, hammer, dig, craft, eat, combat, and item-drop paths. |
+| Personality options | Available | `Adventurer`, `Camper`, `Supporter`, and `None` are configurable. |
+| Player text interaction | Available | Added here through the protected `Networking_Say` server hook. |
+| Voice interaction from the upstream README | Not bundled | It requires a separate `Speech System`; upstream does not include it. `Enable Speech` stays off by default. |
+| Graph CSV export | Disabled | Current DST servers reject arbitrary Mod file writes, which previously crashed the server. |
+| Stuck recovery | Available | The brain resets itself after repeated no-progress checks. `Ctrl+R` remains a manual recovery option. |
+| Multiple companions | Not validated | The original brain shares global state; use one companion. |
 
- In the mod setting, Agents and personalities can be adjusted.   
+## Important compatibility fixes
 
-3. At the starting point, you can find the robot(WX-78) which AI will control. However, you have to turn on FAtiMA-Server to make it move.
- 
-4. So switch the screen to the Desktop from the game. Go to the ‘FAtiMA-Server’ folder in the pre-test folder that you downloaded. 
-   
-5. Double-click ‘FAtiMA-Server.exe’ to launch the program. A prompt will come out. But you don’t need to type anything. 
+- The screen spam `服务器 UttAction: None` was an unconditional debug message
+  emitted every perception tick, not a server error. It has been removed.
+- The legacy graph exporter no longer opens files in the Mod directory, avoiding
+  current DST's `invalid filepath` failure.
+- Follower/leader access is guarded so the companion can start before a player
+  has been assigned.
 
-6. After a while, the program will recognize the current Don’t Starve Together game session and the AI will start to move. 
-   
-7. Turn back to DST and now you can play with the AI companion. 
+## Configuration
 
-## Play Tips
+| Option | Default | Purpose |
+| --- | --- | --- |
+| Number of characters | 1 | Number of WX-78 companions to spawn. One is recommended. |
+| Personality | None | Selects the FAtiMA personality profile. |
+| Enable Text Commands | ON | Enables public-chat command handling. |
+| Chat Prefix | `!ai` | Command prefix, selectable as `!ai` or `/ai`. |
+| Enable Speech | OFF | Requires the unavailable external Speech System. |
+| Enable Showing Graph | OFF | Retained for compatibility; CSV output is disabled. |
 
-When errors occur or meet unexpected situations like AI stuck somewhere, 
+## Validation
 
-1. Press **Ctrl + R**. Then the game will instantly restart without quitting the game.
+Run the regression checks from the editable source directory:
 
-2. If AI stocks in the same position and keep saying ‘I can’t do that’ 
-   : Try to remove all files in ‘Saved Characters’ in FatiMA-Server folder.**
+```powershell
+cd E:\advx饥荒\DST-AICompanion-source
+npm test
+```
 
-## Description 
+The checks validate the Lua source structure without adding dependencies. Full
+game behavior still requires an active DST server and the FAtiMA executable.
 
-The process is performed at every interval.  
-(Mod)perception - transmit - (FAtiMA)receive - decide - transmit - (Mod)execute - perception 
+## Upstream
 
- Each correspondence uses an HTTP transaction.
-
-For more information, please see [FAtiMA-Toolkit DST](https://fatima-toolkit.eu/fatima-toolkit-mcts-and-dont-starve-together/)
-
-## Application 
-
-For my master thesis, 'Speech System' has been also applied. 
-With this system, players can interact with Agents using verbal communication while playing DST together. 
-
-DST mod <-> FAtiMA Server <-> Speech System 
-
-Agent not only replies to player's utterances, it can perform proper actions up to the utterance. For instance, when the player asks an agent for help, the agent will go close to the player.  
-
-## Limitations 
-
-- The codes were hard-coded. Be careful when making changes.  
-- Mod files depend on the game version.
-
-
-
-   
+- Original repository: <https://github.com/votus777/DST-AICompanion>
+- FAtiMA toolkit: <https://github.com/GAIPS/FAtiMA-Toolkit>

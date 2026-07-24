@@ -74,7 +74,7 @@ server_filter_tags = {"ai"}
         },
         default = "None",
     },
-    {
+	{
         name = "Enable Showing Graph",
         label = "Enable Showing Graph",
         hover = "Enable Showing Graph",
@@ -86,8 +86,41 @@ server_filter_tags = {"ai"}
         },
         default = 0,
     },
-    {
-        name = 'OPE',
+	{
+		name = "Enable Speech",
+		label = "Enable Speech",
+		hover = "Requires the optional external Speech System described in the README.",
+		options =
+		{
+			{description = "OFF", data = 0},
+			{description = "ON", data = 1},
+		},
+		default = 0,
+	},
+	{
+		name = "Enable Text Commands",
+		label = "Enable Text Commands",
+		hover = "Lets players give the companion commands through public chat.",
+		options =
+		{
+			{description = "ON", data = 1},
+			{description = "OFF", data = 0},
+		},
+		default = 1,
+	},
+	{
+		name = "Chat Prefix",
+		label = "Chat Prefix",
+		hover = "Only public messages beginning with this prefix are sent to the companion.",
+		options =
+		{
+			{description = "!ai", data = "!ai"},
+			{description = "/ai", data = "/ai"},
+		},
+		default = "!ai",
+	},
+	{
+         name = 'OPE',
         label = 'OPE',
         hover = 'Openness to experience, from cautious/consistent to curious/inventive ',
         options = 

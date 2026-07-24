@@ -1,0 +1,7 @@
+{
+  "name": "dst-ai-companion-local",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}

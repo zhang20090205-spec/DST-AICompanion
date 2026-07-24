@@ -52,6 +52,10 @@ local Goal = "None"
 
 local perception_data = nil
 
+local function GetCompanionConfig(optionname)
+	return GetModConfigData(optionname, KnownModIndex:GetModActualName("The AI Companion"))
+end
+
 local Goal_list = {
 	Adventurer = {
 				Objective = "Maximize_Vison_Score",
@@ -243,7 +247,6 @@ local FAtiMABrain = Class(Brain, function(self, inst, server)
 		if isSuccessful then
 			local speak = result and (result ~= "") and json.decode(result)
 			if speak then
-				TheNet:SystemMessage("Speech Recieved : " .. tostring(speak.Style))
 				self.Utterance = speak.Utterance
 				self.Keyword = speak.Style
 				self.Text = speak.Meaning
@@ -267,7 +270,7 @@ local FAtiMABrain = Class(Brain, function(self, inst, server)
 		else
 			self.Utterance = nil
 			self.UttAction = nil
-			TheNet:SystemMessage("Speech Failed : " .. tostring(http_code))
+			print("[DST AI Companion] Speech request failed: " .. tostring(http_code))
 		end
 	end
 
@@ -288,7 +291,7 @@ local FAtiMABrain = Class(Brain, function(self, inst, server)
 				elseif action.Type == "Speak" then
 					-- Speak Action are made the moment they are received. They only occur every SPEAKACTION_INTERVAL seconds with a percentage of SPEAKACTION_PROB
 					-- Speak([cs],[ns],[m],[sty]) = [t]
-					if math.random(100) < GetModConfigData("speak-chance", KnownModIndex:GetModActualName("FAtiMA-DST")) then
+					if math.random(100) < GetCompanionConfig("speak-chance") then
 						self.inst.components.talker:Say(action.Utterance)
 						-- Tell FAtiMA that the action has ended
 						self:OnActionEndEvent(action.Name, action.Target)
@@ -358,8 +361,8 @@ end)
 
 function FAtiMABrain:GetPersonality()
 
-	if GetModConfigData("personality", KnownModIndex:GetModActualName("The AI Companion")) ~= "None" then
-		return GetModConfigData("personality", KnownModIndex:GetModActualName("The AI Companion"))
+	if GetCompanionConfig("personality") ~= "None" then
+		return GetCompanionConfig("personality")
 	else
 		return "None"
 	end
@@ -367,11 +370,11 @@ end
 
 function FAtiMABrain:GetPersonalityTraits() -- Currently Not used 
 	--Personality (OCEAN model)
-	local OPE = GetModConfigData("OPE", KnownModIndex:GetModActualName("The AI Companion"))
-	local COS = GetModConfigData("COS", KnownModIndex:GetModActualName("The AI Companion"))
-	local EXT = GetModConfigData("EXT", KnownModIndex:GetModActualName("The AI Companion"))
-	local AGR = GetModConfigData("AGR", KnownModIndex:GetModActualName("The AI Companion"))
-	local NEU = GetModConfigData("NEU", KnownModIndex:GetModActualName("The AI Companion"))
+	local OPE = GetCompanionConfig("OPE")
+	local COS = GetCompanionConfig("COS")
+	local EXT = GetCompanionConfig("EXT")
+	local AGR = GetCompanionConfig("AGR")
+	local NEU = GetCompanionConfig("NEU")
 
 	-- OPE : Outgoing (Travel)
 	-- COS : APM ( Action Per minutes )
@@ -564,7 +567,6 @@ end
 local function GetWanderDirection(inst)
 	local pos = Vector3(FAtiMABrain:GetNextNodePosition())
 	inst.wanderdirection = inst:GetAngleToPoint(pos.x, 0, pos.z)
-	TheNet:SystemMessage(tostring(inst.wanderdirection * DEGREES))
 	return inst.wanderdirection * DEGREES
 end
 
@@ -595,44 +597,126 @@ local function keeptargetfn(inst, target)
 	return Player_character == target
 end
 
-function FAtiMABrain:ClassifyUtterance()
-	local keywords = {
-        ["come"] = "Follow",
-        ["go.*away"] = "Goaway",
-        ["wait"] = "Stop",
-        ["oh my god"] = "Approach",
-        ["where.*go"] = "Follow",
-        ["\battack\b "] = "Attack" ,
-        ["attacked"] = "Attack",
-        ["^((?!i|I).).*(can|please)?.*give.*grass.*(please)?"] = "Give_cutgrass",
-        ["^((?!i|I).).*(can|please)?.*give.*rock.*(please)?"] = "Give_rock",
-        ["^((?!i|I).).*(can|please)?.*give.*flint.*(please)?"] = "Give_flint",
-        ["^((?!i|I).).*(can|please)?.*give.*log.*(please)?"] = "Give_log",
-        ["^((?!i|I).).*(can|please)?.*give.*twigs.*(please)?"] = "Give_twigs",
-        ["^((?!i|I).).*(can|please)?.*give.*food.*(please)?"] = "Give_food",
-	    ["let.*kill"] = "Attack",
-	    ["let.*go"] = "Follow",
-	    ["let.*find"] = "Wander",
-	    ["need.*(fire|light)"] = "Build",
-	    ["(?!.*(you)).*need.*help.*(me|please)?"] = "Approach",
-	    ["help.*me"] = "Approach",
-	    ["come.*(back|here)"] = "Follow",
-	    ["go.*find"] = "Wander",
-	    ["build.*fire"] = "Build",
-	    ["go.*(back|home|sleep|camp)"] = "GoHome",
-	    ["make.*(torch|fire|campfire)"] = "Build",
-	    ["help"] = "Approach"
-    }
+local function ContainsAny(text, terms)
+	for _, term in ipairs(terms) do
+		if string.find(text, term, 1, true) ~= nil then
+			return true
+		end
+	end
+	return false
+end
 
-    if self.Utterance ~= nil then
-        self.UttAction = keywords[self.Keyword]
-        if self.UttAction ~= nil then
-            TheNet:SystemMessage("UttAction : " .. self.UttAction)
-        end
-    else
-        self.UttAction = nil
-    end
-    return self.UttAction
+local function GetTextCommandAction(text)
+	local give_items = {
+		{ action = "Give_cutgrass", terms = { "cutgrass", "grass", "草" } },
+		{ action = "Give_rock", terms = { "rock", "rocks", "石头", "石" } },
+		{ action = "Give_flint", terms = { "flint", "燧石" } },
+		{ action = "Give_log", terms = { "log", "logs", "木头", "原木" } },
+		{ action = "Give_twigs", terms = { "twig", "twigs", "树枝" } },
+		{ action = "Give_food", terms = { "food", "食物", "吃的" } },
+	}
+
+	if ContainsAny(text, { "give", "给我", "给" }) then
+		for _, item in ipairs(give_items) do
+			if ContainsAny(text, item.terms) then
+				return item.action
+			end
+		end
+	end
+
+	if ContainsAny(text, { "go away", "leave", "走开", "离远", "别跟" }) then
+		return "Goaway"
+	elseif ContainsAny(text, { "follow", "come", "跟随", "跟我", "过来", "回来" }) then
+		return "Follow"
+	elseif ContainsAny(text, { "stop", "wait", "hold", "停下", "停止", "别动", "待命" }) then
+		return "Stop"
+	elseif ContainsAny(text, { "attack", "fight", "kill", "攻击", "战斗", "打它", "帮我打" }) then
+		return "Attack"
+	elseif ContainsAny(text, { "home", "camp", "回家", "回营", "回基地" }) then
+		return "GoHome"
+	elseif ContainsAny(text, { "wander", "explore", "find", "探索", "找资源", "搜寻" }) then
+		return "Wander"
+	elseif ContainsAny(text, { "help", "救我", "帮我", "帮忙" }) then
+		return "Approach"
+	end
+end
+
+function FAtiMABrain:ClassifyUtterance()
+	local speech_styles = {
+		["come"] = "Follow",
+		["go.*away"] = "Goaway",
+		["wait"] = "Stop",
+		["oh my god"] = "Approach",
+		["where.*go"] = "Follow",
+		["attack"] = "Attack",
+		["attacked"] = "Attack",
+		["help"] = "Approach",
+	}
+
+	if self.Utterance == nil then
+		self.UttAction = nil
+		return nil
+	end
+
+	self.UttAction = speech_styles[self.Keyword]
+		or GetTextCommandAction(string.lower(tostring(self.Utterance)))
+	return self.UttAction
+end
+
+function FAtiMABrain:SetCommandLeader(userid)
+	for _, player in ipairs(AllPlayers) do
+		if player ~= self.inst and player.userid == userid then
+			Player_character = player
+			self:SetLeader()
+			return
+		end
+	end
+end
+
+function FAtiMABrain:QueueTextCommand(text, userid)
+	local command = string.lower(tostring(text or ""))
+	if command == "" then
+		return false
+	end
+
+	self:SetCommandLeader(userid)
+	if ContainsAny(command, { "resume", "continue", "自由行动", "继续", "恢复" }) then
+		self.Utterance = nil
+		self.Keyword = nil
+		self.UttAction = nil
+		self:ClearAction()
+		self.inst.components.talker:Say("Resuming autonomous behavior.")
+		return true
+	end
+
+	self.Utterance = text
+	self.Keyword = nil
+	local action = self:ClassifyUtterance()
+	local acknowledgements = {
+		Follow = "I will follow you.",
+		Goaway = "I will give you some space.",
+		Stop = "I will wait here.",
+		Approach = "I am coming to help.",
+		GoHome = "I will return to camp.",
+		Wander = "I will look around.",
+		Attack = "I will attack your target.",
+		Give_cutgrass = "I will give you grass if I have it.",
+		Give_rock = "I will give you rocks if I have them.",
+		Give_flint = "I will give you flint if I have it.",
+		Give_log = "I will give you logs if I have them.",
+		Give_twigs = "I will give you twigs if I have them.",
+		Give_food = "I will give you food if I have it.",
+	}
+
+	if action ~= nil then
+		self.inst.components.talker:Say(acknowledgements[action])
+		return true
+	end
+
+	self.Utterance = nil
+	self.UttAction = nil
+	self.inst.components.talker:Say("I did not understand. Try !ai follow, stop, help, or give grass.")
+	return false
 end
 
 function FAtiMABrain:IsGiveAction()
@@ -666,13 +750,15 @@ function FAtiMABrain:CheckItemToGive()
             end
         end
     end
-    TheNet:SystemMessage("Flag : " .. tostring(flag) .. " / " .. "GUID :  " .. tostring(item_GUID))
-    return flag, item_GUID
+	return flag, item_GUID
 end
 
 function FAtiMABrain:Perceptions()
 
     local data = {}
+	if Player_character ~= nil and not Player_character:IsValid() then
+		Player_character = nil
+	end
 
 	-- Vision
 	local x, y, z = self.inst.Transform:GetWorldPosition()
@@ -895,7 +981,6 @@ function FAtiMABrain:Perceptions()
 
 		data.Utterance = self.Utterance or "None"
 		data.UttAction = self:ClassifyUtterance() or "None"
-		TheNet:SystemMessage("UttAction" .. " : " ..  tostring(data.UttAction))
 
 
 	end
@@ -905,22 +990,27 @@ function FAtiMABrain:Perceptions()
 	end
 
 	if self.inst.components.follower == nil then
-		self:SetLeader()
+		self.inst:AddComponent("follower")
 		self.inst.components.combat:SetKeepTargetFunction(keeptargetfn)
+	end
+
+	if self:GetLeader() == nil then
+		self:SetPlayerCharacter()
+		self:SetLeader()
 	end
 
 	-- TheNet:SystemMessage("Is Home on Fire : " .. tostring(self:IsHomeOnFire()))
 
 	data.Home = Home.GUID
 
-	if self.inst.components.follower.leader ~= nil then
-		data.Leader = self.inst.components.follower.leader.GUID or "None"
+	local leader = self:GetLeader()
+	if leader ~= nil then
+		data.Leader = leader.GUID or "None"
 	end
 
 	local current_goal = self:GetCurrentGoal(data.Personality, data)
 
 	if Goal ~= current_goal and current_goal ~= nil then
-		TheNet:SystemMessage("Goal has been changed : ".. Goal .. " -> " .. current_goal)
 		self:ChangeState(data.Personality, Goal)
 		Goal = current_goal
 		data.Goal = Goal
@@ -1081,7 +1171,6 @@ end
 
 function FAtiMABrain:ClearAction()
 	if self.CurrentAction ~= nil then
-		TheNet:SystemMessage("Here" )
 		self:OnActionEndEvent(self.CurrentAction.WFN, self.CurrentAction.Target)
 		self.CurrentAction = nil
 	end
@@ -1340,13 +1429,14 @@ function FAtiMABrain:Chop()
 end
 
 function FAtiMABrain:Give()
-	if self.inst.components.follower.leader ~= nil then
+	local leader = self:GetLeader()
+	if leader ~= nil then
 		local flag, item_GUID = self:CheckItemToGive()
 
 		if flag then
 			local c = BufferedAction(
 				self.inst,
-				self.inst.components.follower.leader,
+				leader,
 				ACTIONS.DROP,
 				item_GUID
 			)
@@ -1398,7 +1488,7 @@ function FAtiMABrain:SetPlayerCharacter()
 end
 
 function FAtiMABrain:GetDistance(p1, p2)
-	if p2 ~= nil then
+	if p1 ~= nil and p1:IsValid() and p2 ~= nil and p2:IsValid() then
 		return tonumber(p1:GetDistanceSqToInst(p2))
 	end
 end
@@ -1416,6 +1506,11 @@ function FAtiMABrain:SetLeader()
 		self.inst.components.follower:SetLeader(Player_character)
 		--TheNet:SystemMessage('You are the LEADER!')
 	end
+end
+
+function FAtiMABrain:GetLeader()
+	local follower = self.inst.components.follower
+	return follower ~= nil and follower.leader or nil
 end
 
 function FAtiMABrain:PlayerBufferedAction()
@@ -1635,6 +1730,10 @@ function FAtiMABrain:OnStart()
 		self.TrackingPlayerTask = self.inst:DoPeriodicTask(CHECK_DISTANCE_INTERVAL, self.UpdatePlayerDist, 0)
 	end
 
+	-- The behaviour tree can run before the first perception tick. Establish the
+	-- follower component now so the AI waits safely until a player is available.
+	self:SetLeader()
+
     -----------------------
     ----- Personality -----
     -----------------------
@@ -1662,7 +1761,7 @@ function FAtiMABrain:OnStart()
 		self.SpeakActionTask:Cancel()
 	end
 
-	if GetModConfigData("Enable Speech", KnownModIndex:GetModActualName("The AI Companion"))  == 1 then -- 0 for OFF, 1 for ON
+	if GetCompanionConfig("Enable Speech") == 1 then -- 0 for OFF, 1 for ON
 		self.SpeakActionTask = self.inst:DoPeriodicTask(SPEAKACTION_INTERVAL, self.OnSpeakActionDecide, 0)
 	end
 
@@ -1843,16 +1942,25 @@ function FAtiMABrain:OnStart()
 	local Follow_node = PriorityNode({
 		--DoAction(self.inst, function() return self:Speak("000") end, "DoAction", true),
 
-		IfNode(function() return (self.inst:IsNear(self.inst.components.follower.leader, 20) == false and self.CurrentAction == nil) end, "ClearAction",
+		IfNode(function()
+			local leader = self:GetLeader()
+			return leader ~= nil and not self.inst:IsNear(leader, 20) and self.CurrentAction == nil
+		end, "ClearAction",
 			SequenceNode{
-				Follow(self.inst, function() return self.inst.components.follower.leader end, 2, 1, 20),
+				Follow(self.inst, function() return self:GetLeader() end, 2, 1, 20),
 				WaitNode(math.random(1,6)),
 				StandStill(self.inst),
-				IfNode(function() return self.inst:IsNear(self.inst.components.follower.leader, 3) end, "ClearAction",
+				IfNode(function()
+					local leader = self:GetLeader()
+					return leader ~= nil and self.inst:IsNear(leader, 3)
+				end, "ClearAction",
 						DoAction(self.inst, function() return self:ClearAction() end, "DoAction", true))}),
 
 		-- TO give item, AI should come close to the player. This line allow to keep giving item
-		WhileNode(function() return (self.inst:IsNear(self.inst.components.follower.leader, 2) and self.CurrentAction ~= nil and self.CurrentAction.Action == "DROP") end, "FaceLeader",
+		WhileNode(function()
+			local leader = self:GetLeader()
+			return leader ~= nil and self.inst:IsNear(leader, 2) and self.CurrentAction ~= nil and self.CurrentAction.Action == "DROP"
+		end, "FaceLeader",
 			SequenceNode{
 				FaceEntity(self.inst, GetFaceTargetFn, KeepFaceTargetFn),
 				IfNode(function() return(self.CurrentAction ~= nil and not self.inst:IsNear(self.CurrentAction.Target, 4) ) end, "Clear",
@@ -1873,9 +1981,9 @@ function FAtiMABrain:OnStart()
 	})
 
 	local Trade_node = PriorityNode({
-		IfNode(function() return (Player_character ~= nil and KeepTraderFn(self.inst, Player_character)) end, "Trade",
+		IfNode(function() return (self:GetLeader() ~= nil and Player_character ~= nil and KeepTraderFn(self.inst, Player_character)) end, "Trade",
 		SequenceNode{
-			Follow(self.inst, function() return self.inst.components.follower.leader end, 0, 1, 3),
+			Follow(self.inst, function() return self:GetLeader() end, 0, 1, 3),
 			--FaceEntity(self.inst, GetTraderFn, KeepTraderFn),
 			WaitNode(0.5)
 			-- IfNode(function() return self:Isfood() end, "Eat",
@@ -1885,9 +1993,9 @@ function FAtiMABrain:OnStart()
 
 	local Speak_node =  PriorityNode({
 
-		IfNode(function() return (self.UttAction ~= nil and self.UttAction == "Follow") end, 'Follow',
+		IfNode(function() return (self:GetLeader() ~= nil and self.UttAction ~= nil and self.UttAction == "Follow") end, 'Follow',
 					SequenceNode{
-						Follow(self.inst, function() return self.inst.components.follower.leader end, 0, 1, 3),
+						Follow(self.inst, function() return self:GetLeader() end, 0, 1, 3),
 						DoAction(self.inst, function() return self:ClearAction() end, "Clear", true),
 						StandStill(self.inst)
 						}
