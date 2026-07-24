@@ -9,7 +9,9 @@ local io =  GLOBAL.require "io"
 local os = GLOBAL.require "os"
 graph_data = MODROOT.."graph_data.csv"
 
-local graph_switch = GetModConfigData("Enable Showing Graph") -- 0 for OFF, 1 for ON 
+-- Modern DST rejects arbitrary file writes from mods. The legacy CSV graph exporter
+-- is therefore disabled; it is unrelated to the companion's FAtiMA communication.
+local graph_switch = 0
 local header = ""
 local dt = nil
 
@@ -165,12 +167,9 @@ AddSimPostInit(function ()
 		
 end)
 
-AddGamePostInit(function() -- just called the func once 
-
-    --Clear Old Data		
-	local _f = io.open(graph_data, "w") _f:close()
-	file = io.open(graph_data, "w")
-
+AddGamePostInit(function() -- just called the func once
+	-- The old graph exporter used io.open(MODROOT .. "graph_data.csv"), which
+	-- current dedicated servers reject as an invalid filepath.
 end
 )
 

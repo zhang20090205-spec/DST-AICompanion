@@ -16,8 +16,7 @@ forumthread = "topic/86495-fatima-dst-an-ai-framework/"
 api_version = 10
 
 ---- Can specify a custom icon for this mod!
-icon_atlas = "modicon.xml"
-icon = "modicon.tex"
+-- No custom icon files are packaged with this mod.
 
 --This lets the clients know that they need to download the mod before they can join a server that is using it.
 all_clients_require_mod = true
