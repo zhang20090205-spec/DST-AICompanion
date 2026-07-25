@@ -23,6 +23,7 @@
     "lucide-react": "^0.468.0",
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
+    "undici": "^8.9.0",
     "ws": "^8.21.1"
   },
   "devDependencies": {

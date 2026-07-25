@@ -100,7 +100,14 @@ export class AiriBridge {
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         return;
       }
-      event = parsed as AiriEvent;
+      // Airi's server-runtime serializes outbound messages with superjson, so
+      // the real event ({type,data,metadata}) is nested under `.json`. Unwrap it
+      // when present; inbound plain objects (older/simple messages) pass through.
+      const container = parsed as Record<string, unknown>;
+      const inner = container.json && typeof container.json === "object" && !Array.isArray(container.json)
+        ? container.json as Record<string, unknown>
+        : container;
+      event = inner as unknown as AiriEvent;
     } catch {
       return;
     }
