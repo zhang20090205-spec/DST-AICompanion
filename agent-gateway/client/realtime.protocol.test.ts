@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   REALTIME_CALLS_URL,
   REALTIME_TOOLS,
+  type RealtimeConnectionDiagnostic,
   RealtimeBridge,
   SYSTEM_INSTRUCTIONS,
   buildGatewayRealtimeNotice,
@@ -19,8 +20,13 @@ interface BridgeInternals {
   channel?: { readyState: string; send: (payload: string) => void };
   audio?: { muted: boolean };
   responseInFlight?: boolean;
+  connect: (options?: { recovery?: boolean }) => Promise<void>;
+  disconnect: (detail?: string) => Promise<void>;
   handleRealtimeEvent: (raw: unknown) => Promise<void>;
   connectEventStream: () => void;
+  schedulePeerDisconnect: (reason: string) => void;
+  handleUnexpectedPeerDisconnect: (reason: string) => void;
+  peerReconnectAttempted?: boolean;
 }
 
 function createBridge(): RealtimeBridge {
@@ -429,6 +435,86 @@ test("SSE game fast_intent receipts without raw text track the command and creat
   assert.equal(sent.filter((event) => event.type === "response.create").length, 1);
   assert.equal((sent.find((event) => event.type === "response.create")?.response as { tool_choice?: string } | undefined)?.tool_choice, "none");
   assert.equal(sent.filter((event) => event.type === "conversation.item.create").length, 1);
+});
+
+test("mixed fast task and residual chat queue the residual reply behind the voice preamble", async (t) => {
+  const originalEventSource = Object.getOwnPropertyDescriptor(globalThis, "EventSource");
+  const sent: Array<Record<string, unknown>> = [];
+  const transcripts: Array<{ role: string; text: string }> = [];
+
+  class FakeEventSource {
+    static instance?: FakeEventSource;
+    onerror?: () => void;
+    readonly listeners = new Map<string, Array<(message: MessageEvent<string>) => void>>();
+
+    constructor(_url: string) {
+      FakeEventSource.instance = this;
+    }
+
+    addEventListener(type: string, listener: (message: MessageEvent<string>) => void): void {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+    }
+
+    close(): void {}
+
+    emit(type: string, event: unknown): void {
+      for (const listener of this.listeners.get(type) ?? []) {
+        listener({ data: JSON.stringify(event) } as MessageEvent<string>);
+      }
+    }
+  }
+
+  Object.defineProperty(globalThis, "EventSource", { configurable: true, value: FakeEventSource });
+  t.after(() => {
+    if (originalEventSource) {
+      Object.defineProperty(globalThis, "EventSource", originalEventSource);
+    } else {
+      Reflect.deleteProperty(globalThis, "EventSource");
+    }
+  });
+
+  const bridge = new RealtimeBridge({
+    onStatus: () => undefined,
+    onTranscript: (entry) => transcripts.push({ role: entry.role, text: entry.text }),
+    onGatewayEvent: () => undefined,
+  }, "bot-1") as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+  bridge.connectEventStream();
+
+  FakeEventSource.instance!.emit("player-input", {
+    type: "player-input",
+    companionId: "bot-1",
+    data: {
+      source: "browser",
+      action: "routed",
+      route: "fast_intent",
+      inputId: "mixed-input",
+      pending: true,
+      command: { id: "cmd-mixed", kind: "gather_nearby" },
+      feedback: { policy: "issues_only", channel: "voice_only_preamble" },
+    },
+  });
+  FakeEventSource.instance!.emit("player-input", {
+    type: "player-input",
+    companionId: "bot-1",
+    data: {
+      source: "game",
+      action: "forwarded",
+      route: "realtime",
+      inputId: "mixed-input",
+      reason: "residual_text",
+      residualText: { present: true, route: "realtime" },
+      text: "我今天有点累",
+    },
+  });
+
+  assert.deepEqual(transcripts, [{ role: "player", text: "我今天有点累" }]);
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 1);
+  assert.equal(sent.filter((event) => event.type === "conversation.item.create").length, 2);
+
+  await bridge.handleRealtimeEvent(JSON.stringify({ type: "response.done" }));
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 2);
 });
 
 test("Realtime tool calls reach the Gateway but raw assistant audio transcripts do not", async (t) => {
@@ -1011,6 +1097,269 @@ test("EventSource errors schedule a reconnect instead of immediately closing Rea
   timers[0]!();
   assert.equal(FakeEventSource.instances.length, 2);
   assert.match(FakeEventSource.instances[1]!.url, /local-session/);
+});
+
+test("WebRTC setup reports sanitized session-only diagnostics by stage", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const originalEventSource = Object.getOwnPropertyDescriptor(globalThis, "EventSource");
+  const originalPeerConnection = Object.getOwnPropertyDescriptor(globalThis, "RTCPeerConnection");
+  const diagnostics: RealtimeConnectionDiagnostic[] = [];
+  const posted: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const dataChannelPayloads: Array<Record<string, unknown>> = [];
+
+  class FakeDataChannel {
+    readyState = "open";
+    addEventListener(): void {}
+    send(payload: string): void {
+      dataChannelPayloads.push(JSON.parse(payload) as Record<string, unknown>);
+    }
+    close(): void {
+      this.readyState = "closed";
+    }
+  }
+
+  class FakePeerConnection {
+    static instances: FakePeerConnection[] = [];
+    connectionState: RTCPeerConnectionState = "new";
+    iceConnectionState: RTCIceConnectionState = "new";
+    ontrack?: (event: RTCTrackEvent) => void;
+    onconnectionstatechange?: () => void;
+    oniceconnectionstatechange?: () => void;
+    readonly channel = new FakeDataChannel();
+
+    constructor() {
+      FakePeerConnection.instances.push(this);
+    }
+
+    createDataChannel(): FakeDataChannel {
+      return this.channel;
+    }
+
+    addTrack(): void {}
+
+    async createOffer(): Promise<RTCSessionDescriptionInit> {
+      return { type: "offer", sdp: "v=0 private-offer-sdp" };
+    }
+
+    async setLocalDescription(): Promise<void> {}
+    async setRemoteDescription(): Promise<void> {}
+
+    close(): void {
+      this.connectionState = "closed";
+    }
+  }
+
+  const mediaStream = {
+    getAudioTracks: () => [{ readyState: "live" }],
+    getTracks: () => [{ stop: () => undefined }],
+  };
+  globalThis.fetch = (async (path, init) => {
+    if (String(path) === "/api/realtime/session") {
+      return new Response(JSON.stringify({
+        clientSecret: "ek_test_secret_must_not_render",
+        expiresAt: Date.now() + 60_000,
+        model: "gpt-realtime",
+        sessionId: "session-diagnostics",
+      }), { status: 200 });
+    }
+    if (String(path) === REALTIME_CALLS_URL) {
+      assert.equal(init?.body, "v=0 private-offer-sdp");
+      assert.match(String((init?.headers as Record<string, string>).Authorization), /ek_test_secret/);
+      return new Response("v=0 private-answer-sdp", { status: 200 });
+    }
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    posted.push({ path: String(path), body });
+    return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+  }) as typeof fetch;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      setInterval: () => 1,
+      clearInterval: () => undefined,
+      setTimeout: () => 1,
+      clearTimeout: () => undefined,
+    },
+  });
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: {
+      body: { append: () => undefined },
+      createElement: () => ({
+        autoplay: false,
+        muted: false,
+        srcObject: null,
+        style: {},
+        setAttribute: () => undefined,
+        play: async () => undefined,
+        pause: () => undefined,
+        remove: () => undefined,
+      }),
+    },
+  });
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    value: { mediaDevices: { getUserMedia: async () => mediaStream } },
+  });
+  Object.defineProperty(globalThis, "EventSource", {
+    configurable: true,
+    value: class {
+      constructor(_url: string) {}
+      addEventListener(): void {}
+      close(): void {}
+    },
+  });
+  Object.defineProperty(globalThis, "RTCPeerConnection", { configurable: true, value: FakePeerConnection });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+    if (originalDocument) Object.defineProperty(globalThis, "document", originalDocument);
+    else Reflect.deleteProperty(globalThis, "document");
+    if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+    else Reflect.deleteProperty(globalThis, "navigator");
+    if (originalEventSource) Object.defineProperty(globalThis, "EventSource", originalEventSource);
+    else Reflect.deleteProperty(globalThis, "EventSource");
+    if (originalPeerConnection) Object.defineProperty(globalThis, "RTCPeerConnection", originalPeerConnection);
+    else Reflect.deleteProperty(globalThis, "RTCPeerConnection");
+  });
+
+  const bridge = new RealtimeBridge({
+    onStatus: () => undefined,
+    onTranscript: () => undefined,
+    onGatewayEvent: () => undefined,
+    onDiagnostic: (entry) => diagnostics.push(entry),
+  }, "bot-1");
+
+  await bridge.connect();
+  await bridge.disconnect();
+
+  assert.deepEqual([...new Set(diagnostics.map((entry) => entry.category))].sort(), [
+    "datachannel", "gateway", "mic", "peer-ice", "sdp", "session-secret",
+  ]);
+  assert.equal(diagnostics.some((entry) => entry.stage === "received"), true);
+  assert.equal(diagnostics.some((entry) => entry.stage === "open"), true);
+  const renderedDiagnostics = JSON.stringify(diagnostics);
+  assert.equal(renderedDiagnostics.includes("ek_test_secret"), false);
+  assert.equal(renderedDiagnostics.includes("private-offer-sdp"), false);
+  assert.equal(renderedDiagnostics.includes("private-answer-sdp"), false);
+  assert.equal(posted.every((request) => request.body.type === "voice-state"), true);
+  assert.equal(dataChannelPayloads.some((payload) => payload.type === "session.update"), true);
+});
+
+test("peer and ICE disconnects get one fresh-session retry, then text and !ai fallback", async (t) => {
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const timers: Array<{ delay: number; callback: () => void }> = [];
+  const statuses: Array<{ status: string; detail: string }> = [];
+  const diagnostics: RealtimeConnectionDiagnostic[] = [];
+  const disconnectDetails: string[] = [];
+  const connectOptions: Array<{ recovery?: boolean } | undefined> = [];
+
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: {
+      setTimeout: (callback: () => void, delay: number) => {
+        timers.push({ callback, delay });
+        return timers.length;
+      },
+      clearTimeout: () => undefined,
+    },
+  });
+  t.after(() => {
+    if (originalWindow) Object.defineProperty(globalThis, "window", originalWindow);
+    else Reflect.deleteProperty(globalThis, "window");
+  });
+
+  const bridge = new RealtimeBridge({
+    onStatus: (status, detail) => statuses.push({ status, detail: detail ?? "" }),
+    onTranscript: () => undefined,
+    onGatewayEvent: () => undefined,
+    onDiagnostic: (entry) => diagnostics.push(entry),
+  }, "bot-1") as unknown as BridgeInternals & {
+    connect: (options?: { recovery?: boolean }) => Promise<void>;
+    disconnect: (detail?: string) => Promise<void>;
+  };
+  bridge.disconnect = async (detail?: string) => {
+    disconnectDetails.push(detail ?? "");
+  };
+  bridge.connect = async (options?: { recovery?: boolean }) => {
+    connectOptions.push(options);
+  };
+
+  bridge.schedulePeerDisconnect("ice-disconnected");
+  assert.equal(timers[0]?.delay, 8_000);
+  assert.equal(diagnostics.at(-1)?.category, "peer-ice");
+  assert.equal(diagnostics.at(-1)?.stage, "ice-disconnected");
+
+  timers[0]!.callback();
+  assert.equal(timers[1]?.delay, 1_200);
+  assert.equal(statuses.at(-1)?.status, "connecting");
+  assert.match(statuses.at(-1)?.detail ?? "", /自动建立一个新的语音会话/);
+
+  timers[1]!.callback();
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(disconnectDetails, [""]);
+  assert.deepEqual(connectOptions, [{ recovery: true }]);
+
+  bridge.handleUnexpectedPeerDisconnect("peer-failed");
+  await Promise.resolve();
+  assert.match(disconnectDetails.at(-1) ?? "", /文字输入/);
+  assert.match(disconnectDetails.at(-1) ?? "", /!ai/);
+  assert.equal(diagnostics.at(-1)?.recoverable, false);
+});
+
+test("offline browser text and stop fallback post to Gateway without a voice session or DST interrupt", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const posted: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const transcripts: Array<{ role: string; text: string }> = [];
+  const statuses: Array<{ status: string; detail: string }> = [];
+  globalThis.fetch = (async (path, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    posted.push({ path: String(path), body });
+    if (body.text === "stop") {
+      return new Response(JSON.stringify({ action: "interrupted" }), { status: 200 });
+    }
+    return new Response(JSON.stringify({
+      route: "fast",
+      action: "fast_intent",
+      inputId: body.id,
+      commandId: "cmd-offline-text",
+      kind: "gather_nearby",
+      status: "queued",
+      pending: true,
+      waitRecommended: true,
+      feedback: { policy: "issues_only", channel: "voice_only_preamble" },
+    }), { status: 200 });
+  }) as typeof fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const bridge = new RealtimeBridge({
+    onStatus: (status, detail) => statuses.push({ status, detail: detail ?? "" }),
+    onTranscript: (entry) => transcripts.push({ role: entry.role, text: entry.text }),
+    onGatewayEvent: () => undefined,
+  }, "bot-1");
+
+  await bridge.sendBrowserText("帮我采草");
+  await bridge.sendBrowserText("stop");
+
+  assert.deepEqual(posted.map((request) => request.path), [
+    "/api/dst/v1/companions/bot-1/player-input",
+    "/api/dst/v1/companions/bot-1/player-input",
+  ]);
+  assert.deepEqual(posted.map((request) => request.body.source), ["browser", "browser"]);
+  assert.deepEqual(posted.map((request) => request.body.text), ["帮我采草", "stop"]);
+  assert.equal(posted.some((request) => request.body.type === "interrupt"), false);
+  assert.deepEqual(transcripts, [
+    { role: "player", text: "帮我采草" },
+    { role: "player", text: "stop" },
+  ]);
+  assert.deepEqual(statuses, []);
 });
 
 test("malformed Realtime function arguments stay in the voice session and receive a recoverable tool error", async (t) => {

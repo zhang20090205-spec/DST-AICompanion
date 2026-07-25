@@ -855,6 +855,7 @@ export class RealtimeBridge {
   private interrupting = false;
   private disconnecting = false;
   private peerReconnectAttempted = false;
+  private peerReconnectInProgress = false;
   private responseInFlight = false;
   private playerSpeaking = false;
   private assistantOutputSuppressed = false;
@@ -1098,6 +1099,7 @@ export class RealtimeBridge {
         this.heartbeat = undefined;
       }
       this.clearPeerDisconnectTimer();
+      this.clearPeerReconnectTimer();
       if (this.eventStreamRetryTimer) {
         window.clearTimeout(this.eventStreamRetryTimer);
         this.eventStreamRetryTimer = undefined;
@@ -1185,12 +1187,21 @@ export class RealtimeBridge {
     }
   }
 
-  private sendTextToRealtime(text: string): void {
+  private realtimeChannelReady(): boolean {
+    return Boolean(this.session && this.channel?.readyState === "open");
+  }
+
+  private sendTextToRealtime(text: string, options: { allowPending?: boolean } = {}): boolean {
+    if (!this.realtimeChannelReady()) {
+      this.callbacks.onStatus("disconnected", voiceFallbackDetail("语音没有连接，文字已交给本地 Gateway。"));
+      return false;
+    }
     this.send({
       type: "conversation.item.create",
       item: { type: "message", role: "user", content: [{ type: "input_text", text }] },
     });
-    this.requestRealtimeResponse(true);
+    this.requestRealtimeResponse(options.allowPending ? { allowPending: true } : true);
+    return true;
   }
 
   private async handlePlayerInputRoute(
@@ -1200,7 +1211,7 @@ export class RealtimeBridge {
     inputId: string,
   ): Promise<boolean> {
     if (textRequestsImmediateStop(text)) {
-      if (result.action !== "interrupted" && !this.interrupting) {
+      if (this.session && result.action !== "interrupted" && !this.interrupting) {
         await this.interruptGameFromVoiceCommand();
       }
       return true;
@@ -1605,6 +1616,9 @@ export class RealtimeBridge {
     if (!force && this.playerSpeaking) {
       return;
     }
+    if (!this.realtimeChannelReady()) {
+      return;
+    }
     const response: Record<string, unknown> = {};
     if (toolChoice) {
       response.tool_choice = toolChoice;
@@ -1686,12 +1700,19 @@ export class RealtimeBridge {
           });
           if (notice) {
             this.send(notice.message);
+            const voiceOnlyResponse = event.type === "command-result"
+              || (event.type === "confirmation" && event.data.accepted === true);
             if (event.type === "confirmation" && event.data.accepted === true) {
               if (notice.createResponse && acceptedBegin?.preambleResponse) {
-                this.requestRealtimeResponse({ allowPending: true });
+                this.requestRealtimeResponse({
+                  allowPending: true,
+                  toolChoice: "none",
+                });
               }
             } else if (notice.createResponse) {
-              this.requestRealtimeResponse({ allowPending: true });
+              this.requestRealtimeResponse(voiceOnlyResponse
+                ? { allowPending: true, toolChoice: "none" }
+                : { allowPending: true });
             }
           }
           const handledPlayerInputRoute = this.handlePlayerInputGatewayRoute(event);
@@ -1700,7 +1721,7 @@ export class RealtimeBridge {
           }
           if (event.type === "player-input" && event.data.source === "game" && typeof event.data.text === "string") {
             this.callbacks.onTranscript({ id: crypto.randomUUID(), role: "player", text: event.data.text });
-            this.sendTextToRealtime(event.data.text);
+            this.sendTextToRealtime(event.data.text, { allowPending: true });
           }
         } catch {
           // The gateway intentionally drops malformed live events.
@@ -1709,13 +1730,14 @@ export class RealtimeBridge {
     }
   }
 
-  private schedulePeerDisconnect(): void {
+  private schedulePeerDisconnect(reason: string): void {
     if (this.peerDisconnectTimer || this.disconnecting) {
       return;
     }
+    this.reportConnectionDiagnostic("peer-ice", reason, "Realtime 对等连接暂时断开，等待自动恢复。");
     this.peerDisconnectTimer = window.setTimeout(() => {
       this.peerDisconnectTimer = undefined;
-      void this.disconnect("Realtime connection ended.");
+      void this.handleUnexpectedPeerDisconnect(reason);
     }, PEER_DISCONNECT_GRACE_MS);
   }
 
@@ -1727,6 +1749,40 @@ export class RealtimeBridge {
     this.peerDisconnectTimer = undefined;
   }
 
+  private handleUnexpectedPeerDisconnect(reason: string): void {
+    if (this.disconnecting) {
+      return;
+    }
+    this.clearPeerDisconnectTimer();
+    if (this.peerReconnectAttempted) {
+      if (this.peerReconnectTimer || this.peerReconnectInProgress) {
+        return;
+      }
+      this.reportConnectionDiagnostic("peer-ice", `${reason}-fallback`, "Realtime 对等连接再次中断，已切换到文字备用通道。", false);
+      void this.disconnect(peerReconnectExhaustedDetail());
+      return;
+    }
+    this.peerReconnectAttempted = true;
+    this.reportConnectionDiagnostic("peer-ice", `${reason}-retry`, "Realtime 对等连接中断，将在短暂退避后创建新的语音会话。");
+    this.callbacks.onStatus("connecting", peerReconnectDetail());
+    if (this.peerReconnectTimer) {
+      return;
+    }
+    this.peerReconnectTimer = window.setTimeout(() => {
+      this.peerReconnectTimer = undefined;
+      void (async () => {
+        this.peerReconnectInProgress = true;
+        try {
+          await this.disconnect();
+          this.callbacks.onStatus("connecting", peerReconnectDetail());
+          await this.connect({ recovery: true }).catch(() => undefined);
+        } finally {
+          this.peerReconnectInProgress = false;
+        }
+      })();
+    }, PEER_FRESH_SESSION_RECONNECT_DELAY_MS);
+  }
+
   private scheduleEventStreamReconnect(): void {
     if (!this.session || this.disconnecting || this.eventStreamRetryTimer) {
       return;
@@ -1735,7 +1791,8 @@ export class RealtimeBridge {
     this.events = undefined;
     this.eventStreamFailures += 1;
     if (this.eventStreamFailures > EVENT_STREAM_MAX_RETRIES) {
-      void this.disconnect("Gateway event stream ended.");
+      this.reportConnectionDiagnostic("gateway", "events-exhausted", "本地 Gateway 事件流多次重连失败。", false);
+      void this.disconnect(voiceFallbackDetail("本地 Gateway 事件流连接中断。"));
       return;
     }
     const delay = Math.min(

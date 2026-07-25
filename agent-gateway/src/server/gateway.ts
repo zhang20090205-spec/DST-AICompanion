@@ -507,6 +507,7 @@ export class GatewayCore {
         ? this.interrupt(companionId, "player_stop")
         : this.enqueueFastPlayerCommand(companionId, fastRoute.command.kind, fastRoute.command.args);
       this.markFastPlayerCommand(this.context(companionId), command);
+      const hasResidualText = Boolean(fastRoute.residualText);
       const receipt: PlayerInputReceipt = {
         action: fastRoute.intent === "stop" ? "interrupted" : "routed",
         inputId,
@@ -514,8 +515,12 @@ export class GatewayCore {
         intent: fastRoute.intent,
         reason: fastRoute.reason,
         command: this.safeCommandSummary(command),
+        ...(hasResidualText ? { residualText: { present: true, route: "realtime" } } : {}),
       };
       this.publishSafePlayerInput(companionId, input.source, receipt);
+      if (fastRoute.residualText) {
+        this.publishResidualPlayerInput(companionId, input.source, input.userid, inputId, fastRoute.residualText);
+      }
       return receipt;
     }
     // Transcript text is intentionally only sent to live SSE subscribers, never persisted.
@@ -579,6 +584,27 @@ export class GatewayCore {
       type: "player-input",
       companionId,
       data: { ...receipt, source },
+    });
+  }
+
+  private publishResidualPlayerInput(
+    companionId: string,
+    source: PlayerInput["source"],
+    userid: string | undefined,
+    inputId: string | undefined,
+    text: string,
+  ): void {
+    const receipt: PlayerInputReceipt = {
+      action: "forwarded",
+      inputId,
+      route: "realtime",
+      reason: "residual_text",
+      residualText: { present: true, route: "realtime" },
+    };
+    this.publish({
+      type: "player-input",
+      companionId,
+      data: { ...receipt, text, source: "game", originalSource: source, userid: userid ?? null },
     });
   }
 

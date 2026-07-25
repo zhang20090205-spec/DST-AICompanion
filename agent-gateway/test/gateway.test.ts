@@ -308,6 +308,7 @@ test("fast intent router immediately routes safe Chinese movement and resource c
     assert.equal(receipt.inputId, `${scenario.companionId}-input`);
     assert.equal(receipt.command?.kind, scenario.expectedKind);
     assert.deepEqual(receipt.command?.args, scenario.expectedArgs);
+    assert.equal(receipt.residualText, undefined);
 
     const command = core.pollCommands(scenario.companionId).commands[0]!;
     assert.equal(command.kind, scenario.expectedKind);
@@ -316,6 +317,91 @@ test("fast intent router immediately routes safe Chinese movement and resource c
     assert.equal(event?.data.route, "fast_intent");
     assert.equal("text" in (event?.data ?? {}), false);
   }
+  store.close();
+});
+
+test("mixed safe player input queues one command and relays only residual text live", () => {
+  const { store, core } = createCore();
+  const events: Array<{ type: string; companionId?: string; data: Record<string, unknown> }> = [];
+  core.subscribe((event) => events.push(event));
+  core.receiveState("bot-mixed", {
+    ...fixtureState(),
+    Entities: [{ GUID: 601, Prefab: "grass", Distance: 6, PlayerDistance: 5, Collectable: true }],
+  });
+
+  const receipt = core.receivePlayerInput("bot-mixed", {
+    id: "mixed-safe-command",
+    userid: "KU_private_player",
+    text: "请帮我采草，然后 tell me about camp",
+    source: "voice",
+  });
+
+  assert.equal(receipt.action, "routed");
+  assert.equal(receipt.route, "fast_intent");
+  assert.deepEqual(receipt.residualText, { present: true, route: "realtime" });
+  assert.equal("text" in (receipt as unknown as Record<string, unknown>), false);
+  assert.equal(receipt.command?.kind, "gather_nearby");
+  assert.deepEqual(receipt.command?.args, {
+    mode: "collect",
+    scope: "single",
+    targetGuid: 601,
+    targetPrefab: "grass",
+  });
+
+  const command = core.pollCommands("bot-mixed").commands[0]!;
+  assert.equal(command.id, receipt.command?.id);
+  assert.equal(command.kind, "gather_nearby");
+  assert.deepEqual(command.args, receipt.command?.args);
+
+  const playerEvents = events.filter((event) => event.type === "player-input" && event.companionId === "bot-mixed");
+  assert.equal(playerEvents.length, 2);
+  assert.equal(playerEvents[0]?.data.route, "fast_intent");
+  assert.equal("text" in (playerEvents[0]?.data ?? {}), false);
+  assert.deepEqual(playerEvents[0]?.data.residualText, { present: true, route: "realtime" });
+  assert.equal(playerEvents[1]?.data.action, "forwarded");
+  assert.equal(playerEvents[1]?.data.route, "realtime");
+  assert.equal(playerEvents[1]?.data.reason, "residual_text");
+  assert.equal(playerEvents[1]?.data.text, "tell me about camp");
+  assert.equal(playerEvents[1]?.data.source, "game");
+  assert.equal(playerEvents[1]?.data.originalSource, "voice");
+  assert.deepEqual(playerEvents[1]?.data.residualText, { present: true, route: "realtime" });
+
+  const persisted = JSON.stringify(store.recentAudit()) + String(store.getCompanionMemory("bot-mixed", "current_goal") ?? "");
+  assert.equal(persisted.includes("tell me about camp"), false);
+  assert.equal(persisted.includes("请帮我采草"), false);
+  assert.equal(store.getMemory("transcript"), undefined);
+  store.close();
+});
+
+test("mixed input with multiple safe commands or high-risk residual does not queue locally", () => {
+  const { store, core } = createCore();
+  const events: Array<{ type: string; companionId?: string; data: Record<string, unknown> }> = [];
+  core.subscribe((event) => events.push(event));
+  const state = {
+    ...fixtureState(),
+    Entities: [
+      { GUID: 611, Prefab: "grass", Distance: 6, PlayerDistance: 5, Collectable: true },
+      { GUID: 612, Prefab: "spider", Distance: 7, PlayerDistance: 7, Attackable: true, tags: ["monster"] },
+    ],
+  };
+  core.receiveState("bot-multi", state);
+  const multi = core.receivePlayerInput("bot-multi", { text: "采草然后跟着我", source: "game" });
+  assert.equal(multi.action, "blocked");
+  assert.equal(multi.route, "fast_intent");
+  assert.equal(multi.reason, "ambiguous_intent");
+  assert.equal(core.pollCommands("bot-multi").commands.length, 0);
+
+  core.receiveState("bot-risk-residual", state);
+  const highRisk = core.receivePlayerInput("bot-risk-residual", { text: "采草然后攻击蜘蛛", source: "game" });
+  assert.equal(highRisk.action, "blocked");
+  assert.equal(highRisk.route, "fast_intent");
+  assert.equal(highRisk.reason, "ambiguous_intent");
+  assert.equal(core.pollCommands("bot-risk-residual").commands.length, 0);
+
+  const multiEvent = events.find((event) => event.type === "player-input" && event.companionId === "bot-multi");
+  const riskEvent = events.find((event) => event.type === "player-input" && event.companionId === "bot-risk-residual");
+  assert.equal(multiEvent?.data.text, "采草然后跟着我");
+  assert.equal(riskEvent?.data.text, "采草然后攻击蜘蛛");
   store.close();
 });
 

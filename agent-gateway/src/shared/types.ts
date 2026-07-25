@@ -117,6 +117,11 @@ export interface SafeCommandSummary {
   feedback: FeedbackDirective;
 }
 
+export interface PlayerInputResidualTextIndicator {
+  present: true;
+  route: "realtime";
+}
+
 export interface PlayerInput {
   id?: string;
   userid?: string;
@@ -132,6 +137,7 @@ export interface PlayerInputReceipt {
   reason?: string;
   confirmation?: string;
   command?: SafeCommandSummary;
+  residualText?: PlayerInputResidualTextIndicator;
 }
 
 export interface PendingConfirmation {

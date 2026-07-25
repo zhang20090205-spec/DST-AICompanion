@@ -4,6 +4,8 @@ import { AudioLines, Check, CircleAlert, CircleStop, LoaderCircle, Mic, MicOff, 
 import {
   type ConnectionStatus,
   type GatewayEvent,
+  type RealtimeConnectionDiagnostic,
+  type RealtimeConnectionDiagnosticCategory,
   type RealtimeLatencyEntry,
   type TranscriptEntry,
   RealtimeBridge,
@@ -58,6 +60,15 @@ const LATENCY_LABEL: Record<RealtimeLatencyEntry["metric"], string> = {
   transcript_to_command_start: "下发",
 };
 
+const DIAGNOSTIC_LABEL: Record<RealtimeConnectionDiagnosticCategory, string> = {
+  mic: "麦克风",
+  "session-secret": "会话",
+  sdp: "SDP",
+  datachannel: "DataChannel",
+  "peer-ice": "Peer/ICE",
+  gateway: "Gateway",
+};
+
 function App() {
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const [detail, setDetail] = useState("");
@@ -68,6 +79,7 @@ function App() {
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const [realtimeMode, setRealtimeMode] = useState<{ model?: string; reasoningEffort?: string }>({});
   const [latency, setLatency] = useState<RealtimeLatencyEntry[]>([]);
+  const [connectionDiagnostics, setConnectionDiagnostics] = useState<RealtimeConnectionDiagnostic[]>([]);
   const [gameConnection, setGameConnection] = useState<{ fresh: boolean; reason: string }>({
     fresh: false,
     reason: "等待 DST 上报状态",
@@ -75,10 +87,14 @@ function App() {
   const bridge = useRef<RealtimeBridge | undefined>(undefined);
 
   const indicator = useMemo(() => status === "connected" ? "online" : status === "connecting" ? "pending" : "offline", [status]);
+  const textFallbackEnabled = gameConnection.fresh || status === "connected";
 
   const addAudit = (entry: string) => setAudit((current) => [entry, ...current].slice(0, 8));
   const addTranscript = (entry: TranscriptEntry) => setTranscript((current) => [...current, entry].slice(-30));
   const addLatency = (entry: RealtimeLatencyEntry) => setLatency((current) => [entry, ...current].slice(0, 3));
+  const addConnectionDiagnostic = (entry: RealtimeConnectionDiagnostic) => {
+    setConnectionDiagnostics((current) => [entry, ...current].slice(0, 6));
+  };
 
   useEffect(() => {
     let disposed = false;
@@ -154,7 +170,7 @@ function App() {
     }
   };
 
-  const connect = async () => {
+  const getBridge = () => {
     if (!bridge.current) {
       bridge.current = new RealtimeBridge({
         onStatus: (next, message) => {
@@ -164,10 +180,16 @@ function App() {
         onTranscript: addTranscript,
         onGatewayEvent: handleGatewayEvent,
         onLatency: addLatency,
+        onDiagnostic: addConnectionDiagnostic,
       });
     }
+    return bridge.current;
+  };
+
+  const connect = async () => {
+    setConnectionDiagnostics([]);
     try {
-      await bridge.current.connect();
+      await getBridge().connect();
     } catch (error) {
       setDetail(error instanceof Error ? error.message : "语音连接失败。");
     }
@@ -185,7 +207,7 @@ function App() {
     }
     setInput("");
     try {
-      await bridge.current?.sendBrowserText(value);
+      await getBridge().sendBrowserText(value);
     } catch (error) {
       setDetail(error instanceof Error ? error.message : "消息发送失败。");
       setStatus("error");
@@ -244,6 +266,16 @@ function App() {
 
       {detail && <div className="notice"><CircleAlert size={16} /><span>{detail}</span><button type="button" title="关闭提示" onClick={() => setDetail("")}><X size={15} /></button></div>}
 
+      {connectionDiagnostics.length > 0 && (
+        <section className="audit" aria-label="语音连接诊断">
+          {connectionDiagnostics.map((entry) => (
+            <span key={`${entry.at}-${entry.category}-${entry.stage}`} title={entry.detail}>
+              {DIAGNOSTIC_LABEL[entry.category]} · {entry.stage}
+            </span>
+          ))}
+        </section>
+      )}
+
       <section className="dashboard" aria-label="游戏状态">
         <div className="metric"><span>生命</span><strong>{game.health ?? "--"}</strong></div>
         <div className="metric"><span>饥饿</span><strong>{game.hunger ?? "--"}</strong></div>
@@ -273,8 +305,8 @@ function App() {
 
       <form className="input-row" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
         <input value={input} onChange={(event) => setInput(event.target.value)} placeholder="输入给伙伴的话" maxLength={120} aria-label="发送文字" />
-        <button type="submit" title="发送" disabled={!input.trim() || status !== "connected"}><Send size={18} /></button>
-        <button type="button" className="stop" title="立即停止伙伴动作" onClick={() => void submit("stop")} disabled={status !== "connected"}><CircleStop size={18} /></button>
+        <button type="submit" title="发送" disabled={!input.trim() || !textFallbackEnabled}><Send size={18} /></button>
+        <button type="button" className="stop" title="立即停止伙伴动作" onClick={() => void submit("stop")} disabled={!textFallbackEnabled}><CircleStop size={18} /></button>
       </form>
 
       <footer className="audit" aria-label="动作记录">
