@@ -7,7 +7,10 @@ import { fileURLToPath } from "node:url";
 const modRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 async function readModFile(...segments) {
-  return readFile(path.join(modRoot, ...segments), "utf8");
+  // Normalize CRLF to LF so the structural regexes below stay line-ending
+  // agnostic across Windows (CRLF) and POSIX (LF) checkouts.
+  const contents = await readFile(path.join(modRoot, ...segments), "utf8");
+  return contents.replace(/\r\n/g, "\n");
 }
 
 test("runtime uses GPT Agent brain while preserving the legacy FAtiMA brain file", async () => {
@@ -108,7 +111,7 @@ test("compact nearby state is distance-sorted and carries the player leash used 
 	assert.match(gpt, /for index = 1, math\.min\(#nearby_candidates, MAX_NEARBY\) do/);
 	assert.match(gpt, /playerDistance = player_distance ~= nil/);
 	assert.match(gpt, /function GPTAgentBrain:ResolveGatherTarget\(mode, target_guid, target_prefab\)/);
-	assert.match(gpt, /math\.sqrt\(leader:GetDistanceSqToInst\(entity\)\) <= NEARBY_RANGE/);
+	assert.match(gpt, /math\.sqrt\(leader:GetDistanceSqToInst\(entity\)\) <= PLAYER_LEASH_RANGE/);
 });
 
 test("GPT Agent dispatch is whitelisted and does not execute dynamic code", async () => {
@@ -210,10 +213,10 @@ test("gather commands report started, emit progress, and only finish after the l
 	assert.match(gpt, /local MAX_GATHER_RESULT_TARGETS = 10000/);
 	assert.match(gpt, /function GPTAgentBrain:RefreshGatherSession\(session\)/);
 	assert.match(gpt, /function GPTAgentBrain:IsGatherTargetInRange\(session, entity\)/);
-	assert.match(gpt, /local leader = self:EnsurePlayerTarget\(nil\)[\s\S]*?leader:GetDistanceSqToInst\(entity\)\) <= NEARBY_RANGE/);
+	assert.match(gpt, /local leader = self:EnsurePlayerTarget\(nil\)[\s\S]*?leader:GetDistanceSqToInst\(entity\)\) <= PLAYER_LEASH_RANGE/);
 	assert.match(gpt, /return nil, "player is not nearby"/);
 	assert.match(gpt, /session\.scope == "all_same_prefab"/);
-	assert.match(gpt, /CanonicalPrefab\(entity\.prefab\) ~= session\.targetPrefab/);
+	assert.match(gpt, /CanonicalGatherPrefab\(entity\.prefab\) ~= session\.targetPrefab/);
 	assert.match(gpt, /session\.overflowGuids\[guid\] = true/);
 	assert.match(gpt, /session\.remaining = #candidates \+ self:GatherOverflowCount\(session\)/);
 	assert.match(gpt, /function GPTAgentBrain:StartNextGatherTarget\(target\)/);
@@ -224,6 +227,22 @@ test("gather commands report started, emit progress, and only finish after the l
 	assert.match(gpt, /self:CompleteActiveCommand\("partial", "inventory full"\)/);
 	assert.match(gpt, /buffered:AddSuccessAction\(function\(\)[\s\S]*?self:FinishBufferedCommand\("succeeded"\)\s+end\)/);
 	assert.match(gpt, /buffered:AddFailAction\(function\(\)[\s\S]*?self:FinishBufferedCommand\("failed", "buffered action failed"\)\s+end\)/);
+});
+
+test("gather searches a wider radius, leashes to the player, and canonicalizes prefab families", async () => {
+	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
+
+	assert.match(gpt, /local GATHER_SEARCH_RANGE = 40/);
+	assert.match(gpt, /local PLAYER_LEASH_RANGE = 40/);
+	// The compact state the Gateway sees still uses the tighter sensory radius.
+	assert.match(gpt, /local NEARBY_RANGE = 21/);
+	assert.match(gpt, /TheSim:FindEntities\(x, 0, z, GATHER_SEARCH_RANGE/);
+	assert.match(gpt, /local function CanonicalGatherPrefab\(prefab\)/);
+	assert.match(gpt, /berrybush_juicy = "berrybush"/);
+	assert.match(gpt, /deciduoustree = "evergreen"/);
+	assert.match(gpt, /rock_flintless = "rock1"/);
+	assert.match(gpt, /math\.sqrt\(self\.inst:GetDistanceSqToInst\(leader\)\) > PLAYER_LEASH_RANGE/);
+	assert.match(gpt, /local WORK_ACTION_BY_GATHER_MODE = \{[\s\S]*?chop = "CHOP"[\s\S]*?mine = "MINE"/);
 });
 
 test("active command cancellation and expiry produce honest terminal states", async () => {

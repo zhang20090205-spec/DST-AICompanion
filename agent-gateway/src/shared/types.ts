@@ -108,7 +108,7 @@ export interface FeedbackDirective {
 }
 
 export type PlayerInputAction = "forwarded" | "duplicate" | "interrupted" | "confirmed" | "rejected" | "routed" | "blocked";
-export type PlayerInputRoute = "realtime" | "local_safety" | "confirmation" | "fast_intent";
+export type PlayerInputRoute = "realtime" | "airi" | "local_safety" | "confirmation" | "fast_intent";
 
 export interface SafeCommandSummary {
   id: string;

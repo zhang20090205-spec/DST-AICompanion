@@ -14,6 +14,9 @@ const config: GatewayConfig = {
   realtimeReasoningEffort: "medium",
   realtimeVoice: "marin",
   databasePath: ":memory:",
+  airiWsUrl: "ws://127.0.0.1:6121/ws",
+  airiAuthToken: "test-token",
+  airiModuleName: "dst-companion",
 };
 
 function fixtureState() {
@@ -47,6 +50,24 @@ function createCore() {
 test("Gateway defaults to low Realtime reasoning effort while retaining an explicit high override", () => {
   assert.equal(loadConfig({}).realtimeReasoningEffort, "low");
   assert.equal(loadConfig({ OPENAI_REALTIME_REASONING_EFFORT: "high" }).realtimeReasoningEffort, "high");
+  assert.equal(loadConfig({}).airiWsUrl, "ws://127.0.0.1:6121/ws");
+  assert.throws(() => loadConfig({ AIRI_WS_URL: "ws://192.168.1.2:6121/ws" }), /loopback/);
+});
+
+test("Airi controller mode forwards ordinary game chat without taking the deterministic fast path", () => {
+  const { store, core } = createCore();
+  core.setControllerMode("airi");
+  core.setControllerState(true, true);
+  core.receiveState("bot-1", fixtureState());
+  const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+  core.subscribe((event) => events.push({ type: event.type, data: event.data }));
+
+  const receipt = core.receivePlayerInput("bot-1", { text: "跟着我", source: "game" });
+  assert.equal(receipt.action, "forwarded");
+  assert.equal(receipt.route, "airi");
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
+  assert.equal(events.some((event) => event.type === "player-input" && event.data.route === "airi"), true);
+  store.close();
 });
 
 function withFakeNow<T>(initialNow: number, run: (clock: { set: (value: number) => void; advance: (ms: number) => void }) => T): T {
@@ -405,7 +426,7 @@ test("mixed input with multiple safe commands or high-risk residual does not que
   store.close();
 });
 
-test("fast gather blocks stale, ambiguous, dropped-item, and player-far resource targets", () => {
+test("fast gather blocks stale and ambiguous, but walks to out-of-reach and player-far resources", () => {
   withFakeNow(5_000_000, (clock) => {
     const { store, core } = createCore();
     const events: Array<{ type: string; companionId?: string; data: Record<string, unknown> }> = [];
@@ -436,6 +457,9 @@ test("fast gather blocks stale, ambiguous, dropped-item, and player-far resource
     assert.equal(ambiguous.reason, "ambiguous_intent");
     assert.equal(core.pollCommands("bot-ambiguous").commands.length, 0);
 
+    // No matching bush is visible (only harvested item drops). The router no
+    // longer dead-ends: it queues a prefab-only gather and the Lua brain
+    // searches a wider radius and walks the companion to any grass tuft.
     core.receiveState("bot-drops", {
       ...fixtureState(),
       Entities: [
@@ -445,17 +469,25 @@ test("fast gather blocks stale, ambiguous, dropped-item, and player-far resource
       ],
     });
     const droppedItem = core.receivePlayerInput("bot-drops", { text: "采草", source: "game" });
-    assert.equal(droppedItem.action, "blocked");
-    assert.equal(droppedItem.reason, "target_unavailable");
+    assert.equal(droppedItem.action, "routed");
+    assert.equal(droppedItem.command?.kind, "gather_nearby");
+    assert.deepEqual(droppedItem.command?.args, { mode: "collect", scope: "single", targetPrefab: "grass" });
 
+    // A grass tuft the companion can see but the player has wandered 22 units
+    // from is now within the gather leash, so the companion walks over.
     core.receiveState("bot-player-far", {
       ...fixtureState(),
       Entities: [{ GUID: 507, Prefab: "grass", Distance: 5, PlayerDistance: 22, Collectable: true }],
     });
     const playerFar = core.receivePlayerInput("bot-player-far", { text: "采草", source: "voice" });
-    assert.equal(playerFar.action, "blocked");
-    assert.equal(playerFar.reason, "target_unavailable");
-    assert.throws(() => core.enqueue("bot-player-far", "gather_nearby", { mode: "collect", targetGuid: 507 }, "player"), ValidationError);
+    assert.equal(playerFar.action, "routed");
+    assert.equal(playerFar.command?.kind, "gather_nearby");
+    assert.deepEqual(playerFar.command?.args, { mode: "collect", scope: "single", targetGuid: 507, targetPrefab: "grass" });
+    assert.equal(core.pollCommands("bot-player-far").commands[0]?.kind, "gather_nearby");
+    core.receiveResult("bot-player-far", { id: playerFar.command!.id, status: "cancelled", stateRevision: 1 });
+
+    // Movement (approach) keeps its tighter boundary: a player past the
+    // movement distance must still be clarified, never chased.
     core.receiveState("bot-player-far", { ...fixtureState(), Distance: 22 });
     const farApproach = core.receivePlayerInput("bot-player-far", { text: "过来", source: "game" });
     assert.equal(farApproach.action, "blocked");
@@ -463,10 +495,6 @@ test("fast gather blocks stale, ambiguous, dropped-item, and player-far resource
     const ambiguousEnglishWait = core.receivePlayerInput("bot-player-far", { text: "wait a second", source: "voice" });
     assert.equal(ambiguousEnglishWait.action, "forwarded");
     assert.equal(ambiguousEnglishWait.route, "realtime");
-    assert.equal(core.pollCommands("bot-player-far").commands.length, 0);
-    // The fast router and command validator use the same approach boundary.
-    // A target just outside the validator's range must be clarified, never
-    // accepted locally only to fail while queueing the command.
     core.receiveState("bot-approach-boundary", { ...fixtureState(), Distance: 21 });
     const approachBoundary = core.receivePlayerInput("bot-approach-boundary", { text: "过来", source: "voice" });
     assert.equal(approachBoundary.action, "blocked");
@@ -479,6 +507,35 @@ test("fast gather blocks stale, ambiguous, dropped-item, and player-far resource
     assert.equal(blockedGameInput?.data.text, "采草和树枝");
     store.close();
   });
+});
+
+test("fast router recognizes chop, mine, homophones, and walks to out-of-sight resources", () => {
+  const { store, core } = createCore();
+
+  // 砍 forces chop mode; the visible evergreen resolves to a concrete target.
+  core.receiveState("bot-chop", fixtureState());
+  const chop = core.receivePlayerInput("bot-chop", { text: "砍树", source: "voice" });
+  assert.equal(chop.action, "routed");
+  assert.equal(chop.command?.kind, "gather_nearby");
+  assert.deepEqual(chop.command?.args, { mode: "chop", scope: "single", targetGuid: 100, targetPrefab: "evergreen" });
+
+  core.receiveState("bot-chop-all", fixtureState());
+  const chopAll = core.receivePlayerInput("bot-chop-all", { text: "把树都砍了", source: "game" });
+  assert.equal(chopAll.action, "routed");
+  assert.deepEqual(chopAll.command?.args, { mode: "chop", scope: "all_same_prefab", targetGuid: 100, targetPrefab: "evergreen" });
+
+  // 挖 forces mine mode; no boulder is visible, so it defers to the Lua brain.
+  core.receiveState("bot-mine", fixtureState());
+  const mine = core.receivePlayerInput("bot-mine", { text: "挖石头", source: "voice" });
+  assert.equal(mine.action, "routed");
+  assert.deepEqual(mine.command?.args, { mode: "mine", scope: "single", targetPrefab: "rock1" });
+
+  // 姜果 is a common ASR misrecognition of 浆果 and must still route to berries.
+  core.receiveState("bot-homophone", fixtureState());
+  const homophone = core.receivePlayerInput("bot-homophone", { text: "采姜果", source: "voice" });
+  assert.equal(homophone.action, "routed");
+  assert.deepEqual(homophone.command?.args, { mode: "collect", scope: "single", targetPrefab: "berrybush" });
+  store.close();
 });
 
 test("fast intents do not cancel pending high-risk confirmations", () => {
@@ -1669,5 +1726,63 @@ test("Realtime session proxy sends a stable hashed safety identifier without lea
   assert.equal(JSON.stringify(first.json()).includes(rawUserId), false);
 
   await app.close();
+  store.close();
+});
+
+test("Airi HTTP tools expose fresh state and preserve call idempotency", async () => {
+  const { store, core } = createCore();
+  core.setControllerMode("airi");
+  core.setControllerState(true, true);
+  core.receiveState("bot-1", fixtureState());
+  const app = createGatewayApp(config, core, () => ({
+    airiConfigured: true,
+    airiConnected: true,
+    airiAuthenticated: true,
+  }));
+
+  const state = await app.inject({ method: "GET", url: "/api/airi/v1/companions/bot-1/state" });
+  assert.equal(state.statusCode, 200);
+  assert.equal(state.json().stateFresh, true);
+
+  const first = await app.inject({
+    method: "POST",
+    url: "/api/airi/v1/companions/bot-1/tools/dst_follow",
+    payload: { callId: "airi-follow-1", args: {} },
+  });
+  const duplicate = await app.inject({
+    method: "POST",
+    url: "/api/airi/v1/companions/bot-1/tools/dst_follow",
+    payload: { callId: "airi-follow-1", args: {} },
+  });
+  assert.equal(first.statusCode, 200);
+  assert.equal(duplicate.statusCode, 200);
+  assert.equal(first.json().commandId, duplicate.json().commandId);
+  assert.equal(core.pollCommands("bot-1").commands.length, 1);
+
+  const health = await app.inject({ method: "GET", url: "/api/health" });
+  assert.equal(health.json().controllerMode, "airi");
+  assert.equal(health.json().airiAuthenticated, true);
+
+  await app.close();
+  store.close();
+});
+
+test("Airi disconnect fails closed and cancels queued gameplay", async () => {
+  const { store, core } = createCore();
+  core.setControllerMode("airi");
+  core.setControllerState(true, true);
+  core.receiveState("bot-1", fixtureState());
+  const result = await core.handleAiriTool("bot-1", "follow_player", {}, "disconnect-follow");
+  assert.equal(typeof result.command?.id, "string");
+  const epochBefore = core.getEpoch("bot-1");
+
+  core.setControllerState(false, false);
+  assert.equal(core.getEpoch("bot-1") > epochBefore, true);
+  const snapshot = core.companionSnapshot("bot-1");
+  assert.equal(snapshot.controllerConnected, false);
+  await assert.rejects(
+    core.handleAiriTool("bot-1", "follow_player", {}, "offline-follow"),
+    /offline/,
+  );
   store.close();
 });

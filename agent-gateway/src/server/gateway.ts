@@ -19,6 +19,7 @@ import { FastIntentRouter } from "./fast-intent-router.js";
 import {
   ValidationError,
   boundedExpiry,
+  canonicalGatherPrefab,
   isCommandKind,
   isLikelyHostile,
   normalizeState,
@@ -169,7 +170,13 @@ const GATHER_RESOURCE_LABELS: Record<string, { label: string; unit: string }> = 
   rocks: { label: "岩石", unit: "块" },
   rock1: { label: "岩石", unit: "块" },
   rock2: { label: "岩石", unit: "块" },
+  rock_flintless: { label: "岩石", unit: "块" },
+  rock_moon: { label: "月岩", unit: "块" },
   flint: { label: "燧石", unit: "块" },
+  reeds: { label: "芦苇", unit: "丛" },
+  flower: { label: "花", unit: "朵" },
+  flower_evil: { label: "恶之花", unit: "朵" },
+  evergreen_sparse: { label: "枯树", unit: "棵" },
 };
 
 const REALTIME_TOOLS = new Set([
@@ -206,8 +213,43 @@ export class GatewayCore {
   private readonly seenInputIds = new Map<string, number>();
   private readonly realtimeToolResults = new Map<string, RealtimeToolRecord>();
   private readonly fastIntentRouter = new FastIntentRouter();
+  private controllerMode: "realtime" | "airi" = "realtime";
+  private controllerConnected = false;
+  private controllerAuthenticated = false;
+  private lastControllerActivity = 0;
 
   constructor(readonly store: GatewayStore) {}
+
+  setControllerMode(mode: "realtime" | "airi"): void {
+    this.controllerMode = mode;
+  }
+
+  setControllerState(active: boolean, authenticated = active): void {
+    const wasConnected = this.controllerConnected;
+    this.controllerConnected = active;
+    this.controllerAuthenticated = active && authenticated;
+    this.lastControllerActivity = Date.now();
+    for (const context of this.companions.values()) {
+      this.setVoiceState(context.id, active);
+    }
+    if (active || wasConnected) {
+      this.publish({
+        type: "controller-state",
+        companionId: "default",
+        data: { mode: this.controllerMode, connected: active, authenticated: this.controllerAuthenticated },
+      });
+    }
+  }
+
+  touchController(): void {
+    if (!this.controllerConnected) {
+      return;
+    }
+    this.lastControllerActivity = Date.now();
+    for (const context of this.companions.values()) {
+      context.lastVoiceActivity = this.lastControllerActivity;
+    }
+  }
 
   subscribe(listener: (event: GatewayEvent) => void): () => void {
     this.listeners.add(listener);
@@ -468,6 +510,15 @@ export class GatewayCore {
         confirmation: confirmation.id,
         reason: "player_declined",
       };
+    }
+    if (this.controllerMode === "airi") {
+      const receipt: PlayerInputReceipt = { action: "forwarded", inputId, route: "airi" };
+      this.publish({
+        type: "player-input",
+        companionId,
+        data: { ...receipt, text: normalized, source: input.source, userid: input.userid ?? null },
+      });
+      return receipt;
     }
     const fastRoute = this.fastIntentRouter.route(normalized, context.state);
     if (context.confirmation && fastRoute.status !== "none" && fastRoute.intent !== "stop") {
@@ -792,6 +843,52 @@ export class GatewayCore {
     });
   }
 
+  // Declared async so that fail-closed guard rejections surface as a rejected
+  // promise rather than a synchronous throw. Callers (and tests) treat every
+  // Airi tool invocation as an awaitable that can reject.
+  async handleAiriTool(
+    companionId: string,
+    name: unknown,
+    rawArgs: unknown,
+    idempotenceKey: string,
+  ): Promise<{ output: Record<string, unknown>; command?: Command }> {
+    if (this.controllerMode !== "airi") {
+      throw new ValidationError("Airi controller mode is not enabled.");
+    }
+    const safeName = typeof name === "string" ? name : "";
+    if (!this.controllerConnected && !["get_game_state", "stop_and_wait", "clear_action_queue"].includes(safeName)) {
+      throw new ValidationError("Airi is offline; gameplay tools are unavailable.");
+    }
+    this.touchController();
+    return this.handleRealtimeTool(companionId, name, rawArgs, idempotenceKey);
+  }
+
+  companionSnapshot(companionId: string): Record<string, unknown> {
+    const context = this.context(companionId);
+    this.expire(context);
+    return {
+      id: context.id,
+      epoch: context.epoch,
+      controllerMode: this.controllerMode,
+      controllerConnected: this.controllerConnected,
+      controllerAuthenticated: this.controllerAuthenticated,
+      airiConnected: this.controllerMode === "airi" && this.controllerConnected,
+      airiAuthenticated: this.controllerMode === "airi" && this.controllerAuthenticated,
+      state: context.state ? this.publicState(context.state) : null,
+      stateFresh: Boolean(context.state && Date.now() - context.state.receivedAt < 5_000),
+      confirmation: context.confirmation ? {
+        id: context.confirmation.id,
+        prompt: context.confirmation.prompt,
+        expiresAt: context.confirmation.expiresAt,
+        kind: context.confirmation.command.kind,
+      } : null,
+      activeCommand: context.active ? this.publicCommandLifecycle(context.commandLifecycles.get(context.active.command.id)) : null,
+      queuedCommands: context.queue.slice(0, 8).map((record) =>
+        this.publicCommandLifecycle(context.commandLifecycles.get(record.command.id)),
+      ).filter((record): record is Record<string, unknown> => Boolean(record)),
+    };
+  }
+
   private async runRealtimeTool(
     companionId: string,
     name: string,
@@ -892,6 +989,9 @@ export class GatewayCore {
   }
 
   runAutonomy(now = Date.now()): void {
+    if (this.controllerMode === "airi") {
+      return;
+    }
     for (const context of this.companions.values()) {
       this.expire(context, now);
       const state = context.state;
@@ -928,6 +1028,9 @@ export class GatewayCore {
   }
 
   watchdog(now = Date.now()): void {
+    if (this.controllerConnected && now - this.lastControllerActivity > 15_000) {
+      this.setControllerState(false, false);
+    }
     for (const context of this.companions.values()) {
       this.expire(context, now);
       if (context.voiceConnected && now - context.lastVoiceActivity > 15_000) {
@@ -947,6 +1050,10 @@ export class GatewayCore {
 
   status(): Record<string, unknown> {
     return {
+      controllerMode: this.controllerMode,
+      controllerConnected: this.controllerConnected,
+      controllerAuthenticated: this.controllerAuthenticated,
+      lastControllerActivity: this.lastControllerActivity || null,
       companions: [...this.companions.values()].map((context) => ({
         id: context.id,
         epoch: context.epoch,
@@ -954,6 +1061,7 @@ export class GatewayCore {
         voiceActive: context.voiceSpeaking,
         voiceConnected: context.voiceConnected,
         voiceOfflineStandby: context.voiceOfflineStandby,
+        controllerConnected: this.controllerConnected,
         confirmation: context.confirmation ? {
           id: context.confirmation.id,
           prompt: context.confirmation.prompt,
@@ -984,10 +1092,10 @@ export class GatewayCore {
         pendingTrustedGatherMessages: [],
         trustedGatherSpeechCommandIds: new Set<string>(),
         fastPlayerCommandIds: new Set<string>(),
-        voiceConnected: false,
+        voiceConnected: this.controllerMode === "airi" ? this.controllerConnected : false,
         voiceSpeaking: false,
-        voiceOfflineStandby: true,
-        lastVoiceActivity: 0,
+        voiceOfflineStandby: this.controllerMode === "airi" ? !this.controllerConnected : true,
+        lastVoiceActivity: this.controllerMode === "airi" ? this.lastControllerActivity : 0,
         lastAutonomyAt: 0,
       };
       this.companions.set(id, context);
@@ -1259,13 +1367,13 @@ export class GatewayCore {
     const expectedScope = command.args.scope === "all_same_prefab" ? "all_same_prefab" : "single";
     const expectedMode = command.args.mode === "chop" || command.args.mode === "mine" ? command.args.mode : "collect";
     const expectedPrefab = typeof command.args.targetPrefab === "string"
-      ? normalizePrefabName(command.args.targetPrefab)
+      ? canonicalGatherPrefab(command.args.targetPrefab)
       : "";
     if (
       gather.scope !== expectedScope
       || gather.mode !== expectedMode
       || !expectedPrefab
-      || gather.targetPrefab !== expectedPrefab
+      || canonicalGatherPrefab(gather.targetPrefab) !== expectedPrefab
     ) {
       throw new ValidationError("Gather outcome does not match the canonical queued gather command.");
     }

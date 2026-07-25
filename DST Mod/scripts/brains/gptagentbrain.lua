@@ -7,6 +7,11 @@ local COMPANION_ID = "default"
 local STATE_POST_INTERVAL = 0.5
 local COMMAND_POLL_INTERVAL = 0.25
 local NEARBY_RANGE = 21
+-- Gathering may look and walk beyond the reported nearby radius so the companion
+-- can fetch resources that are a little further out, and roam up to a leash from
+-- the player instead of demanding the resource sit right next to both of them.
+local GATHER_SEARCH_RANGE = 40
+local PLAYER_LEASH_RANGE = 40
 local ATTACK_COMMAND_RANGE = 12
 local MAX_NEARBY = 40
 local MAX_GATHER_TARGETS = 40
@@ -238,6 +243,36 @@ end
 
 local function CanonicalPrefab(prefab)
 	return string.lower(SafeText(tostring(prefab or ""), 64))
+end
+
+-- Mirror of the Gateway resource lexicon families. A spoken resource can spawn
+-- as several prefab variants; the companion matches and reports them all as one
+-- canonical family primary so trusted gather outcomes line up with the command.
+local GATHER_PREFAB_FAMILY = {
+	grass = "grass",
+	berrybush = "berrybush",
+	berrybush2 = "berrybush",
+	berrybush_juicy = "berrybush",
+	sapling = "sapling",
+	sapling_moon = "sapling",
+	carrot = "carrot",
+	carrot_planted = "carrot",
+	reeds = "reeds",
+	flower = "flower",
+	flower_evil = "flower",
+	evergreen = "evergreen",
+	evergreen_sparse = "evergreen",
+	deciduoustree = "evergreen",
+	twiggytree = "evergreen",
+	rock1 = "rock1",
+	rock2 = "rock1",
+	rock_flintless = "rock1",
+	rock_moon = "rock1",
+}
+
+local function CanonicalGatherPrefab(prefab)
+	local canonical = CanonicalPrefab(prefab)
+	return GATHER_PREFAB_FAMILY[canonical] or canonical
 end
 
 local function IsGatherableEntity(entity, mode)
@@ -940,29 +975,30 @@ end
 function GPTAgentBrain:IsGatherTargetInRange(session, entity)
 	if entity == self.inst
 		or not IsGatherableEntity(entity, session.mode)
-		or CanonicalPrefab(entity.prefab) ~= session.targetPrefab
-		or math.sqrt(self.inst:GetDistanceSqToInst(entity)) > NEARBY_RANGE then
+		or CanonicalGatherPrefab(entity.prefab) ~= session.targetPrefab
+		or math.sqrt(self.inst:GetDistanceSqToInst(entity)) > GATHER_SEARCH_RANGE then
 		return false
 	end
 	-- “Nearby” is the companion's local sensory radius, but a bulk gather must
-	-- not pull it away from the player.  If the player moves away mid-session,
-	-- the remaining entities become skipped and the truthful terminal result is
+	-- not pull it away from the player.  The companion may roam up to a leash to
+	-- reach a resource; if the player moves beyond that leash mid-session, the
+	-- remaining entities become skipped and the truthful terminal result is
 	-- partial instead of silently wandering after them.
 	local leader = self:EnsurePlayerTarget(nil)
 	return IsValidEntity(leader)
-		and math.sqrt(leader:GetDistanceSqToInst(entity)) <= NEARBY_RANGE
+		and math.sqrt(leader:GetDistanceSqToInst(entity)) <= PLAYER_LEASH_RANGE
 end
 
 function GPTAgentBrain:ResolveGatherTarget(mode, target_guid, target_prefab)
-	local canonical_prefab = CanonicalPrefab(target_prefab)
+	local canonical_prefab = CanonicalGatherPrefab(target_prefab)
 	local leader = self:EnsurePlayerTarget(nil)
 	local function is_valid_target(entity)
 		return entity ~= self.inst
 			and IsGatherableEntity(entity, mode)
-			and math.sqrt(self.inst:GetDistanceSqToInst(entity)) <= NEARBY_RANGE
+			and math.sqrt(self.inst:GetDistanceSqToInst(entity)) <= GATHER_SEARCH_RANGE
 			and IsValidEntity(leader)
-			and math.sqrt(leader:GetDistanceSqToInst(entity)) <= NEARBY_RANGE
-			and (canonical_prefab == "" or CanonicalPrefab(entity.prefab) == canonical_prefab)
+			and math.sqrt(leader:GetDistanceSqToInst(entity)) <= PLAYER_LEASH_RANGE
+			and (canonical_prefab == "" or CanonicalGatherPrefab(entity.prefab) == canonical_prefab)
 	end
 	if IsFiniteNumber(target_guid) then
 		local target = Ents[math.floor(target_guid)]
@@ -973,7 +1009,7 @@ function GPTAgentBrain:ResolveGatherTarget(mode, target_guid, target_prefab)
 	end
 
 	local x, _, z = self.inst.Transform:GetWorldPosition()
-	local ents = TheSim:FindEntities(x, 0, z, NEARBY_RANGE, nil, { "INLIMBO", "NOCLICK", "CLASSIFIED", "FX" }, nil)
+	local ents = TheSim:FindEntities(x, 0, z, GATHER_SEARCH_RANGE, nil, { "INLIMBO", "NOCLICK", "CLASSIFIED", "FX" }, nil)
 	local best = nil
 	local best_distance = nil
 	for _, entity in ipairs(ents or {}) do
@@ -1041,7 +1077,7 @@ function GPTAgentBrain:RefreshGatherSession(session)
 
 	if session.scope == "all_same_prefab" then
 		local x, _, z = self.inst.Transform:GetWorldPosition()
-		local ents = TheSim:FindEntities(x, 0, z, NEARBY_RANGE, nil, { "INLIMBO", "NOCLICK", "CLASSIFIED", "FX" }, nil)
+		local ents = TheSim:FindEntities(x, 0, z, GATHER_SEARCH_RANGE, nil, { "INLIMBO", "NOCLICK", "CLASSIFIED", "FX" }, nil)
 		for _, entity in ipairs(ents or {}) do
 			local guid = EntityGuid(entity)
 			if guid ~= nil
@@ -1188,7 +1224,7 @@ end
 function GPTAgentBrain:ApplyGatherCommand(command)
 	local args = command.args or {}
 	local leader = self:EnsurePlayerTarget(nil)
-	if not IsValidEntity(leader) or math.sqrt(self.inst:GetDistanceSqToInst(leader)) > NEARBY_RANGE then
+	if not IsValidEntity(leader) or math.sqrt(self.inst:GetDistanceSqToInst(leader)) > PLAYER_LEASH_RANGE then
 		return nil, "player is not nearby"
 	end
 	local mode = "collect"
@@ -1200,9 +1236,9 @@ function GPTAgentBrain:ApplyGatherCommand(command)
 	if target == nil then
 		return nil, "no valid nearby gather target"
 	end
-	local target_prefab = CanonicalPrefab(args.targetPrefab)
+	local target_prefab = CanonicalGatherPrefab(args.targetPrefab)
 	if target_prefab == "" then
-		target_prefab = CanonicalPrefab(target.prefab)
+		target_prefab = CanonicalGatherPrefab(target.prefab)
 	end
 	self:InterruptLocalAction("start gather", false, true)
 	self.GPTGatherSession = {

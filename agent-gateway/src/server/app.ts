@@ -16,6 +16,11 @@ interface RealtimeCommandParams {
   id: string;
 }
 
+interface AiriToolParams {
+  id: string;
+  tool: string;
+}
+
 interface RealtimeCommandQuery {
   sessionId?: string;
   companionId?: string;
@@ -72,7 +77,15 @@ function rejectedRealtimeToolOutput(callId: string, error: ValidationError): { c
   };
 }
 
-export function createGatewayApp(config: GatewayConfig, core: GatewayCore): FastifyInstance {
+export function createGatewayApp(
+  config: GatewayConfig,
+  core: GatewayCore,
+  airiStatus: () => Record<string, unknown> = () => ({
+    airiConfigured: Boolean(config.airiAuthToken),
+    airiConnected: false,
+    airiAuthenticated: false,
+  }),
+): FastifyInstance {
   const app = Fastify({ logger: false, trustProxy: false });
 
   app.addHook("onRequest", async (request, reply) => {
@@ -93,8 +106,60 @@ export function createGatewayApp(config: GatewayConfig, core: GatewayCore): Fast
     realtimeConfigured: Boolean(config.apiKey),
     model: config.realtimeModel,
     reasoningEffort: config.realtimeReasoningEffort,
+    ...airiStatus(),
     ...core.status(),
   }));
+
+  app.post("/api/dashboard/session", async () => core.registerBrowserSession());
+
+  app.get<{ Params: CompanionParams }>("/api/airi/v1/companions/:id/state", async (request) => {
+    return core.companionSnapshot(request.params.id);
+  });
+
+  app.post<{ Params: AiriToolParams; Body: unknown }>("/api/airi/v1/companions/:id/tools/:tool", async (request) => {
+    const body = asRecord(request.body);
+    if (typeof body.callId !== "string" || body.callId.length < 1 || body.callId.length > 128) {
+      throw new ValidationError("Airi tool request requires a valid callId.");
+    }
+    const toolNames: Record<string, string> = {
+      dst_observe: "get_game_state",
+      dst_follow: "follow_player",
+      dst_stop: "stop_and_wait",
+      dst_move: "approach_or_retreat",
+      dst_gather: "gather_nearby",
+      dst_defend: "attack_nearby_threat",
+      dst_equip_or_eat: "equip_or_eat",
+      dst_give_item: "give_item",
+      dst_say_in_game: "say_in_game",
+    };
+    const toolName = toolNames[request.params.tool];
+    if (!toolName) {
+      throw new ValidationError("Unknown Airi DST tool.");
+    }
+    const args = parseToolArguments(body.args ?? {});
+    const result = await core.handleAiriTool(request.params.id, toolName, args, body.callId);
+    return { callId: body.callId, output: result.output, commandId: result.command?.id ?? null };
+  });
+
+  app.get<{ Params: { id: string; commandId: string }; Querystring: { timeoutMs?: string } }>(
+    "/api/airi/v1/companions/:id/commands/:commandId/wait",
+    async (request) => {
+      const parsed = typeof request.query.timeoutMs === "string" ? Number.parseInt(request.query.timeoutMs, 10) : 120_000;
+      const timeoutMs = Number.isFinite(parsed) ? Math.max(0, Math.min(parsed, 120_000)) : 120_000;
+      const lifecycle = await core.waitForCommandTerminal(request.params.id, request.params.commandId, timeoutMs);
+      if (!lifecycle) {
+        throw new ValidationError("Unknown command id.");
+      }
+      return { command: lifecycle };
+    },
+  );
+
+  app.post<{ Params: CompanionParams; Body: unknown }>("/api/airi/v1/companions/:id/interrupt", async (request) => {
+    const body = asRecord(request.body);
+    const reason = typeof body.reason === "string" ? body.reason.slice(0, 80) : "airi_interrupt";
+    const command = core.interrupt(request.params.id, reason);
+    return { accepted: true, commandId: command.id, epoch: command.epoch };
+  });
 
   app.get<{ Params: CompanionParams }>("/api/dst/v1/companions/:id/commands", async (request) => {
     return core.pollCommands(request.params.id);

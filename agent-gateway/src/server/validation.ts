@@ -14,6 +14,7 @@ import {
   type GatherScope,
   type NearbyEntity,
 } from "../shared/types.js";
+import { RESOURCE_LEXICON, normalizePrefab } from "../shared/resource-lexicon.js";
 
 const MAX_CHAT_LENGTH = 120;
 const MAX_NEARBY = 40;
@@ -25,6 +26,27 @@ export const MAX_MOVEMENT_DISTANCE = 20;
 export const MAX_FOLLOW_DISTANCE = 21;
 const MAX_DISTANCE = MAX_MOVEMENT_DISTANCE;
 const MAX_GATHER_DISTANCE = 21;
+// The companion may roam up to this leash from the player to reach and gather a
+// resource. This replaces the old "target must be within 21 of the player"
+// gate so slightly-away players no longer block gathering; the Lua brain also
+// enforces the same leash and walks the companion to the resource.
+export const MAX_GATHER_LEASH = 40;
+
+// Map every known resource prefab to its family primary so a spoken resource
+// (which may spawn as several prefab variants) canonicalizes to one stable
+// prefab for command args and trusted outcome matching.
+const GATHER_PREFAB_FAMILY = new Map<string, string>();
+for (const resource of RESOURCE_LEXICON) {
+  const primary = normalizePrefab(resource.prefabs[0]);
+  for (const prefab of resource.prefabs) {
+    GATHER_PREFAB_FAMILY.set(normalizePrefab(prefab), primary);
+  }
+}
+
+export function canonicalGatherPrefab(value: unknown): string {
+  const normalized = normalizePrefab(value);
+  return GATHER_PREFAB_FAMILY.get(normalized) ?? normalized;
+}
 const MAX_GATHER_TARGETS = 40;
 const MAX_GATHER_RESULT_TARGETS = 10_000;
 const MAX_TTL_MS = 30_000;
@@ -258,11 +280,16 @@ function supportsGatherMode(entity: NearbyEntity, mode: GatherMode): boolean {
   return entity.collectable === true;
 }
 
+/** Capability-only check (no distance) used by the deterministic router. */
+export function isGatherModeAvailable(entity: NearbyEntity, mode: GatherMode): boolean {
+  return supportsGatherMode(entity, mode);
+}
+
 export function isGatherTargetAvailable(state: CompanionState, entity: NearbyEntity, mode?: GatherMode): boolean {
   const gatherMode = mode ?? (entity.choppable ? "chop" : entity.mineable ? "mine" : "collect");
   return entity.distance <= MAX_GATHER_DISTANCE
     && supportsGatherMode(entity, gatherMode)
-    && gatherPlayerDistance(state, entity) <= MAX_GATHER_DISTANCE;
+    && gatherPlayerDistance(state, entity) <= MAX_GATHER_LEASH;
 }
 
 function gatherPlayerDistance(state: CompanionState, entity: NearbyEntity): number {
@@ -304,13 +331,13 @@ function canonicalGatherTarget(
     .filter((entity) => isGatherTargetAvailable(state, entity, mode))
     .sort((left, right) => left.distance - right.distance || left.guid - right.guid);
   const target = targetGuid === undefined
-    ? candidates.find((entity) => targetPrefab === undefined || canonicalPrefab(entity.prefab) === targetPrefab)
+    ? candidates.find((entity) => targetPrefab === undefined || canonicalGatherPrefab(entity.prefab) === targetPrefab)
     : candidates.find((entity) => entity.guid === targetGuid);
 
   if (!target) {
     throw new ValidationError("Gather target is invalid or too far away.");
   }
-  if (targetPrefab !== undefined && canonicalPrefab(target.prefab) !== targetPrefab) {
+  if (targetPrefab !== undefined && canonicalGatherPrefab(target.prefab) !== targetPrefab) {
     throw new ValidationError("Gather targetGuid and targetPrefab do not match fresh game state.");
   }
   return target;
@@ -360,13 +387,30 @@ export function validateCommandArgs(
     }
     const mode: GatherMode = isGatherMode(args.mode) ? args.mode : "collect";
     const scope: GatherScope = isGatherScope(args.scope) ? args.scope : "single";
-    const target = canonicalGatherTarget(state, mode, args.targetGuid, args.targetPrefab);
-    return {
-      mode,
-      scope,
-      targetGuid: target.guid,
-      targetPrefab: canonicalPrefab(target.prefab),
-    };
+    if (args.targetGuid !== undefined) {
+      const target = canonicalGatherTarget(state, mode, args.targetGuid, args.targetPrefab);
+      return {
+        mode,
+        scope,
+        targetGuid: target.guid,
+        targetPrefab: canonicalGatherPrefab(target.prefab),
+      };
+    }
+    // No concrete guid: if a matching entity is already visible and reachable,
+    // resolve the nearest one now so the companion heads straight to it. If none
+    // is visible, defer discovery to the Lua brain, which searches a wider
+    // radius and walks the companion to the resource family.
+    const targetPrefab = canonicalGatherPrefab(args.targetPrefab);
+    if (!targetPrefab) {
+      throw new ValidationError("Gather requires a targetGuid or a targetPrefab.");
+    }
+    const visible = state.nearby
+      .filter((entity) => canonicalGatherPrefab(entity.prefab) === targetPrefab && isGatherTargetAvailable(state, entity, mode))
+      .sort((left, right) => left.distance - right.distance || left.guid - right.guid)[0];
+    if (visible) {
+      return { mode, scope, targetGuid: visible.guid, targetPrefab };
+    }
+    return { mode, scope, targetPrefab };
   }
   if (kind === "attack_nearby_threat") {
     const targetGuid = typeof args.targetGuid === "number" ? Math.floor(args.targetGuid) : undefined;

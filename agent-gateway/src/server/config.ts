@@ -8,6 +8,9 @@ export interface GatewayConfig {
   realtimeReasoningEffort: RealtimeReasoningEffort;
   realtimeVoice: string;
   databasePath: string;
+  airiWsUrl: string;
+  airiAuthToken?: string;
+  airiModuleName: string;
 }
 
 export type RealtimeReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -38,6 +41,21 @@ function parseRealtimeReasoningEffort(value: string | undefined): RealtimeReason
   return effort as RealtimeReasoningEffort;
 }
 
+function parseAiriWsUrl(value: string | undefined): string {
+  const raw = value?.trim() || "ws://127.0.0.1:6121/ws";
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error("AIRI_WS_URL must be a valid WebSocket URL.");
+  }
+  if ((url.protocol !== "ws:" && url.protocol !== "wss:")
+    || !["127.0.0.1", "localhost", "::1", "[::1]"].includes(url.hostname)) {
+    throw new Error("AIRI_WS_URL must use ws/wss and a loopback host.");
+  }
+  return url.toString();
+}
+
 export function loadConfig(env = process.env): GatewayConfig {
   const requestedHost = env.DST_GATEWAY_HOST ?? "127.0.0.1";
   if (requestedHost !== "127.0.0.1") {
@@ -52,5 +70,8 @@ export function loadConfig(env = process.env): GatewayConfig {
     realtimeReasoningEffort: parseRealtimeReasoningEffort(env.OPENAI_REALTIME_REASONING_EFFORT),
     realtimeVoice: env.OPENAI_REALTIME_VOICE?.trim() || "marin",
     databasePath: env.DST_GATEWAY_DATABASE?.trim() || "data/dst-gpt-agent.sqlite",
+    airiWsUrl: parseAiriWsUrl(env.AIRI_WS_URL),
+    airiAuthToken: env.AIRI_AUTH_TOKEN?.trim() || undefined,
+    airiModuleName: env.AIRI_MODULE_NAME?.trim() || "dst-companion",
   };
 }

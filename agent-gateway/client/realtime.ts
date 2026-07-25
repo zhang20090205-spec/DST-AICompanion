@@ -126,6 +126,8 @@ export const SYSTEM_INSTRUCTIONS = [
   "玩家要求停止或清空动作时，直接调用 stop_and_wait 或 clear_action_queue，不要说等待前言或完成语；停止相关回执保持安静。",
   "收到可信 Gateway 快速路由或 confirmation accepted 回执后，只代表 Gateway 已经排队对应命令；可以说一次很短的语音等待前言，但不要调用任何游戏工具，不要再次调用同一个动作工具，只能等待 command-result。",
   "快速路由的玩家指令已经由 Gateway 执行排队；不要重新解析原始玩家话语、不要重新调用工具、不要提前宣称完成。",
+  "采集、砍树、挖矿都用 gather_nearby：草/浆果/树枝/胡萝卜/芦苇/花用 mode=collect，树用 mode=chop，石头/矿石/巨石用 mode=mine。只给 targetPrefab 即可（可省略 targetGuid），伙伴会在更大范围内寻找并走到资源旁采集；“把附近所有…”用 scope=all_same_prefab。",
+  "如果收到采集类动作的 target_unavailable 或 failed 回执，先调用 get_game_state 查看附近资源，再用 gather_nearby（带 targetPrefab，必要时 scope=all_same_prefab）让伙伴走过去重试，而不是直接让玩家靠近；只有可信结果确认附近确实没有该资源时，才如实说明附近没有。",
   "只有收到可信的游戏动作终态回执 command-result 且 status=succeeded、并且结果中的 remaining=0、skipped=0 后，才能说全部完成。status=partial、failed 或 cancelled 必须如实说明部分完成、失败或取消，绝不臆造采集数量。",
   "只有高风险动作才可调用 request_confirmation：攻击非敌对对象、消耗稀有物品或给予稀有物品。采集、跟随和靠近绝不能调用 request_confirmation。",
   "自主行为每次最多做一个低风险动作，除非危险或需要确认，否则保持安静。",
@@ -190,7 +192,7 @@ export const REALTIME_TOOLS = [
   {
     type: "function",
     name: "gather_nearby",
-    description: "Low-risk action: collect, chop, or mine ordinary nearby resources. For 'collect all nearby berries', use scope=all_same_prefab and targetGuid or targetPrefab. In the same response, say at most one short browser-audio-only natural preamble immediately before calling this tool; never claim completion before command-result. If trusted Gateway context says a fast player command is already routed, do not call this tool again.",
+    description: "Low-risk action: collect, chop, or mine ordinary resources. mode=collect for grass/berries/twigs/carrots/reeds/flowers, chop for trees, mine for rocks/boulders. targetPrefab alone is enough (no targetGuid needed) — the companion searches a wider area and walks to the resource. For 'collect all nearby berries', use scope=all_same_prefab. In the same response, say at most one short browser-audio-only natural preamble immediately before calling this tool; never claim completion before command-result. If trusted Gateway context says a fast player command is already routed, do not call this tool again.",
     parameters: {
       type: "object",
       properties: {

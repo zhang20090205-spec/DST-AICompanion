@@ -1,16 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { AudioLines, Check, CircleAlert, CircleStop, LoaderCircle, Mic, MicOff, Send, Timer, X } from "lucide-react";
-import {
-  type ConnectionStatus,
-  type GatewayEvent,
-  type RealtimeConnectionDiagnostic,
-  type RealtimeConnectionDiagnosticCategory,
-  type RealtimeLatencyEntry,
-  type TranscriptEntry,
-  RealtimeBridge,
-} from "./realtime";
+import { Activity, CircleAlert, Loader, Wifi, WifiOff } from "lucide-react";
 import "./styles.css";
+
+// The dashboard is intentionally decoupled from ./realtime (the dormant
+// OpenAI Realtime bridge). It never requests a microphone and never speaks to
+// OpenAI — it only reads gateway status over the loopback HTTP + SSE API.
+interface GatewayEvent {
+  type: string;
+  companionId?: string;
+  data: Record<string, unknown>;
+}
 
 interface VisibleState {
   health?: number | null;
@@ -19,262 +19,432 @@ interface VisibleState {
   temperature?: number | null;
   phase?: string;
   action?: string | null;
-  connected?: boolean;
+}
+
+interface CommandLifecycle {
+  id?: string;
+  kind?: string;
+  status?: string;
+  terminal?: boolean;
+  progress?: Record<string, unknown> | null;
+  result?: { status?: string; reason?: string } | null;
 }
 
 interface Confirmation {
   id: string;
   prompt?: string;
+  kind?: string;
   expiresAt?: number;
+}
+
+interface AiriStatus {
+  configured: boolean;
+  connected: boolean;
+  authenticated: boolean;
+  mode: string;
+  lastActivity: number | null;
+}
+
+interface RecentResult {
+  key: string;
+  label: string;
+  tone: "ok" | "warn" | "bad" | "info";
+  at: number;
 }
 
 interface GatewayHealthCompanion {
   id?: string;
   connected?: boolean;
-  confirmation?: Confirmation | null;
-}
-
-interface GatewayAuditEvent {
-  event?: string;
-  metadata?: Record<string, unknown>;
+  confirmation?: (Confirmation & { kind?: string }) | null;
+  activeCommand?: CommandLifecycle | null;
 }
 
 interface GatewayHealth {
+  airiConfigured?: boolean;
+  airiConnected?: boolean;
+  airiAuthenticated?: boolean;
+  controllerMode?: string;
+  lastControllerActivity?: number | null;
   companions?: GatewayHealthCompanion[];
-  model?: string;
-  reasoningEffort?: string;
-  audit?: GatewayAuditEvent[];
+  audit?: { event?: string; metadata?: Record<string, unknown> }[];
 }
 
-const STATUS_LABEL: Record<ConnectionStatus, string> = {
-  disconnected: "未连接",
-  connecting: "连接中",
-  connected: "语音已连接",
-  error: "连接异常",
+const COMPANION_ID = "default";
+const SESSION_REFRESH_MS = 8 * 60_000;
+const RECONNECT_DELAY_MS = 2_000;
+const SSE_EVENT_TYPES = [
+  "controller-state",
+  "game-state",
+  "command",
+  "command-lifecycle",
+  "command-progress",
+  "command-result",
+  "confirmation",
+  "interrupt",
+  "trusted-gather-message",
+];
+
+const STATUS_LABEL: Record<string, string> = {
+  queued: "排队",
+  dispatched: "已下发",
+  started: "执行中",
+  progress: "进行中",
+  succeeded: "成功",
+  partial: "部分完成",
+  failed: "失败",
+  cancelled: "已取消",
 };
 
-const LATENCY_LABEL: Record<RealtimeLatencyEntry["metric"], string> = {
-  speech_to_first_assistant_output: "首响",
-  tool_to_command_start: "动作",
-  transcript_to_gateway_route: "路由",
-  transcript_to_command_start: "下发",
-};
+function statusLabel(status: unknown): string {
+  return typeof status === "string" ? STATUS_LABEL[status] ?? status : "--";
+}
 
-const DIAGNOSTIC_LABEL: Record<RealtimeConnectionDiagnosticCategory, string> = {
-  mic: "麦克风",
-  "session-secret": "会话",
-  sdp: "SDP",
-  datachannel: "DataChannel",
-  "peer-ice": "Peer/ICE",
-  gateway: "Gateway",
-};
+function toneForStatus(status: unknown): RecentResult["tone"] {
+  if (status === "succeeded") return "ok";
+  if (status === "partial") return "warn";
+  if (status === "failed" || status === "cancelled") return "bad";
+  return "info";
+}
+
+function gatherSummary(gather: Record<string, unknown> | null | undefined): string {
+  if (!gather || typeof gather !== "object") {
+    return "";
+  }
+  const prefab = typeof gather.targetPrefab === "string" ? gather.targetPrefab : "目标";
+  const completed = Number(gather.completed ?? 0);
+  const attempted = Number(gather.attempted ?? 0);
+  const remaining = Number(gather.remaining ?? 0);
+  const skipped = Number(gather.skipped ?? 0);
+  let text = `${prefab} 采集 ${completed}/${attempted}`;
+  if (remaining) text += `，剩余 ${remaining}`;
+  if (skipped) text += `，跳过 ${skipped}`;
+  return text;
+}
 
 function App() {
-  const [status, setStatus] = useState<ConnectionStatus>("disconnected");
-  const [detail, setDetail] = useState("");
-  const [input, setInput] = useState("");
-  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
-  const [game, setGame] = useState<VisibleState>({});
-  const [audit, setAudit] = useState<string[]>([]);
-  const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
-  const [realtimeMode, setRealtimeMode] = useState<{ model?: string; reasoningEffort?: string }>({});
-  const [latency, setLatency] = useState<RealtimeLatencyEntry[]>([]);
-  const [connectionDiagnostics, setConnectionDiagnostics] = useState<RealtimeConnectionDiagnostic[]>([]);
-  const [gameConnection, setGameConnection] = useState<{ fresh: boolean; reason: string }>({
-    fresh: false,
-    reason: "等待 DST 上报状态",
+  const [airi, setAiri] = useState<AiriStatus>({
+    configured: false,
+    connected: false,
+    authenticated: false,
+    mode: "realtime",
+    lastActivity: null,
   });
-  const bridge = useRef<RealtimeBridge | undefined>(undefined);
+  const [game, setGame] = useState<VisibleState>({});
+  const [gameFresh, setGameFresh] = useState(false);
+  const [activeCommand, setActiveCommand] = useState<CommandLifecycle | null>(null);
+  const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
+  const [recent, setRecent] = useState<RecentResult[]>([]);
+  const [audit, setAudit] = useState<string[]>([]);
+  const [sseConnected, setSseConnected] = useState(false);
+  const [notice, setNotice] = useState("");
 
-  const indicator = useMemo(() => status === "connected" ? "online" : status === "connecting" ? "pending" : "offline", [status]);
-  const textFallbackEnabled = gameConnection.fresh || status === "connected";
+  const recentSeq = useRef(0);
 
-  const addAudit = (entry: string) => setAudit((current) => [entry, ...current].slice(0, 8));
-  const addTranscript = (entry: TranscriptEntry) => setTranscript((current) => [...current, entry].slice(-30));
-  const addLatency = (entry: RealtimeLatencyEntry) => setLatency((current) => [entry, ...current].slice(0, 3));
-  const addConnectionDiagnostic = (entry: RealtimeConnectionDiagnostic) => {
-    setConnectionDiagnostics((current) => [entry, ...current].slice(0, 6));
+  const addRecent = (label: string, tone: RecentResult["tone"]) => {
+    recentSeq.current += 1;
+    setRecent((current) => [{ key: `r-${recentSeq.current}`, label, tone, at: Date.now() }, ...current].slice(0, 10));
   };
 
+  const applyLifecycle = (lifecycle: CommandLifecycle | null | undefined) => {
+    if (!lifecycle || typeof lifecycle !== "object") {
+      return;
+    }
+    if (lifecycle.terminal === true) {
+      setActiveCommand((current) => (current && current.id === lifecycle.id ? null : current));
+    } else if (lifecycle.status !== undefined) {
+      setActiveCommand(lifecycle);
+    }
+  };
+
+  const handleGatewayEvent = (event: GatewayEvent) => {
+    const data = event.data ?? {};
+    switch (event.type) {
+      case "controller-state": {
+        setAiri((current) => ({
+          ...current,
+          mode: typeof data.mode === "string" ? data.mode : current.mode,
+          connected: data.connected === true,
+          authenticated: data.authenticated === true,
+        }));
+        break;
+      }
+      case "game-state": {
+        const state = data.state as Record<string, unknown> | undefined;
+        if (state) {
+          const world = state.world as Record<string, unknown> | undefined;
+          setGame({
+            health: typeof state.health === "number" ? state.health : null,
+            hunger: typeof state.hunger === "number" ? state.hunger : null,
+            sanity: typeof state.sanity === "number" ? state.sanity : null,
+            temperature: typeof state.temperature === "number" ? state.temperature : null,
+            phase: typeof world?.phase === "string" ? world.phase : undefined,
+            action: typeof state.currentAction === "string" ? state.currentAction : null,
+          });
+          setGameFresh(true);
+        }
+        break;
+      }
+      case "command": {
+        applyLifecycle(data.command as CommandLifecycle | undefined);
+        break;
+      }
+      case "command-lifecycle": {
+        applyLifecycle(data as CommandLifecycle);
+        break;
+      }
+      case "command-progress": {
+        applyLifecycle(data.lifecycle as CommandLifecycle | undefined);
+        break;
+      }
+      case "command-result": {
+        const kind = typeof data.kind === "string" ? data.kind : "动作";
+        const result = data.result as { status?: string; reason?: string } | undefined;
+        const reason = result?.reason ? `（${result.reason}）` : "";
+        addRecent(`${kind} · ${statusLabel(result?.status)}${reason}`, toneForStatus(result?.status));
+        applyLifecycle(data.lifecycle as CommandLifecycle | undefined);
+        break;
+      }
+      case "interrupt": {
+        const reason = typeof data.reason === "string" ? data.reason : "已打断";
+        addRecent(`打断 · ${reason}`, "bad");
+        setActiveCommand(null);
+        break;
+      }
+      case "trusted-gather-message": {
+        if (data.deferred === true) {
+          break;
+        }
+        const outcome = data.outcome as Record<string, unknown> | undefined;
+        const summary = gatherSummary(outcome?.gather as Record<string, unknown> | undefined);
+        if (summary) {
+          addRecent(`采集 · ${summary}`, toneForStatus(data.status));
+        }
+        break;
+      }
+      case "confirmation": {
+        if (data.expired || data.cancelled || data.accepted === true || data.accepted === false) {
+          setConfirmation(null);
+        } else if (typeof data.id === "string") {
+          const command = data.command as Record<string, unknown> | undefined;
+          setConfirmation({
+            id: data.id,
+            prompt: typeof data.prompt === "string" ? data.prompt : "需要玩家确认",
+            kind: typeof command?.kind === "string" ? command.kind : undefined,
+            expiresAt: typeof data.expiresAt === "number" ? data.expiresAt : undefined,
+          });
+        }
+        break;
+      }
+      default:
+        break;
+    }
+  };
+
+  // Self-managed dashboard session + SSE stream (no OpenAI, no microphone).
   useEffect(() => {
     let disposed = false;
-    const refreshGatewaySnapshot = async () => {
+    let source: EventSource | undefined;
+    let reconnectTimer: number | undefined;
+    let refreshTimer: number | undefined;
+
+    const clearReconnect = () => {
+      if (reconnectTimer !== undefined) {
+        window.clearTimeout(reconnectTimer);
+        reconnectTimer = undefined;
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (disposed || reconnectTimer !== undefined) {
+        return;
+      }
+      reconnectTimer = window.setTimeout(() => {
+        reconnectTimer = undefined;
+        void connect();
+      }, RECONNECT_DELAY_MS);
+    };
+
+    const connect = async () => {
+      if (disposed) {
+        return;
+      }
+      source?.close();
+      source = undefined;
+      try {
+        const response = await fetch("/api/dashboard/session", { method: "POST" });
+        if (!response.ok) {
+          throw new Error("无法创建本地面板会话。");
+        }
+        const session = await response.json() as { sessionId?: string };
+        if (disposed || typeof session.sessionId !== "string") {
+          return;
+        }
+        const events = new EventSource(`/api/events?sessionId=${encodeURIComponent(session.sessionId)}`);
+        source = events;
+        events.onopen = () => {
+          if (!disposed) {
+            setSseConnected(true);
+            setNotice("");
+          }
+        };
+        events.onerror = () => {
+          if (disposed) {
+            return;
+          }
+          setSseConnected(false);
+          events.close();
+          if (source === events) {
+            source = undefined;
+          }
+          // The session may have expired (absolute 10-minute TTL). Reconnect
+          // always mints a fresh session rather than reusing the old id.
+          scheduleReconnect();
+        };
+        for (const type of SSE_EVENT_TYPES) {
+          events.addEventListener(type, (message) => {
+            try {
+              const parsed = JSON.parse((message as MessageEvent).data) as GatewayEvent;
+              if (parsed && typeof parsed.type === "string") {
+                handleGatewayEvent(parsed);
+              }
+            } catch {
+              // Ignore malformed frames; the stream stays open.
+            }
+          });
+        }
+      } catch (error) {
+        if (!disposed) {
+          setSseConnected(false);
+          setNotice(error instanceof Error ? error.message : "本地面板会话连接失败。");
+          scheduleReconnect();
+        }
+      }
+    };
+
+    void connect();
+    // Proactively refresh before the absolute session TTL expires.
+    refreshTimer = window.setInterval(() => void connect(), SESSION_REFRESH_MS);
+
+    return () => {
+      disposed = true;
+      clearReconnect();
+      if (refreshTimer !== undefined) {
+        window.clearInterval(refreshTimer);
+      }
+      source?.close();
+    };
+  }, []);
+
+  // Health poll: authoritative 2s snapshot of Airi/controller status, DST
+  // freshness, active command, confirmation, and the audit tail.
+  useEffect(() => {
+    let disposed = false;
+    const refresh = async () => {
       try {
         const response = await fetch("/api/health");
         if (!response.ok || disposed) {
           return;
         }
         const health = await response.json() as GatewayHealth;
-        const companion = health.companions?.find((candidate) => candidate.id === "default");
-        const interruption = health.audit?.find((entry) => entry.event === "interrupted" || entry.event === "command_cancelled");
-        const interruptionReason = typeof interruption?.metadata?.reason === "string"
-          ? interruption.metadata.reason
-          : "";
-        if (!disposed) {
-          setConfirmation(companion?.confirmation ?? null);
-          setGame((current) => ({ ...current, connected: companion?.connected === true }));
-          setGameConnection(companion?.connected === true
-            ? { fresh: true, reason: "DST 状态已连接" }
-            : {
-                fresh: false,
-                reason: interruptionReason
-                  ? `DST 状态已过期；最近取消：${interruptionReason}`
-                  : "DST 状态未连接或已过期，不能安全下发游戏动作",
-              });
-          setRealtimeMode({
-            model: typeof health.model === "string" ? health.model : undefined,
-            reasoningEffort: typeof health.reasoningEffort === "string" ? health.reasoningEffort : undefined,
-          });
+        if (disposed) {
+          return;
         }
+        setAiri((current) => ({
+          configured: health.airiConfigured === true,
+          connected: health.airiConnected === true,
+          authenticated: health.airiAuthenticated === true,
+          mode: typeof health.controllerMode === "string" ? health.controllerMode : current.mode,
+          lastActivity: typeof health.lastControllerActivity === "number" ? health.lastControllerActivity : null,
+        }));
+        const companion = health.companions?.find((candidate) => candidate.id === COMPANION_ID);
+        setGameFresh(companion?.connected === true);
+        setActiveCommand(companion?.activeCommand ?? null);
+        setConfirmation((current) => {
+          if (companion?.confirmation && typeof companion.confirmation.id === "string") {
+            return {
+              id: companion.confirmation.id,
+              prompt: companion.confirmation.prompt ?? "需要玩家确认",
+              kind: companion.confirmation.kind,
+              expiresAt: companion.confirmation.expiresAt,
+            };
+          }
+          return companion ? null : current;
+        });
+        setAudit((health.audit ?? [])
+          .map((entry) => (typeof entry.event === "string" ? entry.event : ""))
+          .filter(Boolean)
+          .slice(0, 8));
       } catch {
-        // A local health refresh must never tear down the active voice session.
+        // A failed health poll must never crash the read-only dashboard.
       }
     };
 
-    void refreshGatewaySnapshot();
-    const interval = window.setInterval(() => void refreshGatewaySnapshot(), 2_000);
+    void refresh();
+    const interval = window.setInterval(() => void refresh(), 2_000);
     return () => {
       disposed = true;
       window.clearInterval(interval);
     };
   }, []);
 
-  const handleGatewayEvent = (event: GatewayEvent) => {
-    if (event.type === "game-state") {
-      const state = event.data.state as Record<string, unknown> | undefined;
-      if (state) {
-        const world = state.world as Record<string, unknown> | undefined;
-        setGame({
-          health: typeof state.health === "number" ? state.health : null,
-          hunger: typeof state.hunger === "number" ? state.hunger : null,
-          sanity: typeof state.sanity === "number" ? state.sanity : null,
-          temperature: typeof state.temperature === "number" ? state.temperature : null,
-          phase: typeof world?.phase === "string" ? world.phase : undefined,
-          action: typeof state.currentAction === "string" ? state.currentAction : null,
-          connected: true,
-        });
-      }
-    } else if (event.type === "confirmation") {
-      if (event.data.expired || event.data.accepted === true || event.data.accepted === false) {
-        setConfirmation(null);
-      } else if (typeof event.data.id === "string") {
-        setConfirmation({
-          id: event.data.id,
-          prompt: typeof event.data.prompt === "string" ? event.data.prompt : "需要确认",
-          expiresAt: typeof event.data.expiresAt === "number" ? event.data.expiresAt : undefined,
-        });
-      }
-    } else if (event.type === "command" || event.type === "command-result" || event.type === "interrupt") {
-      const kind = typeof event.data.kind === "string" ? event.data.kind : event.type;
-      addAudit(kind);
-    }
-  };
-
-  const getBridge = () => {
-    if (!bridge.current) {
-      bridge.current = new RealtimeBridge({
-        onStatus: (next, message) => {
-          setStatus(next);
-          setDetail(message ?? "");
-        },
-        onTranscript: addTranscript,
-        onGatewayEvent: handleGatewayEvent,
-        onLatency: addLatency,
-        onDiagnostic: addConnectionDiagnostic,
-      });
-    }
-    return bridge.current;
-  };
-
-  const connect = async () => {
-    setConnectionDiagnostics([]);
-    try {
-      await getBridge().connect();
-    } catch (error) {
-      setDetail(error instanceof Error ? error.message : "语音连接失败。");
-    }
-  };
-
-  const disconnect = async () => {
-    await bridge.current?.disconnect();
-    bridge.current = undefined;
-  };
-
-  const submit = async (text = input) => {
-    const value = text.trim();
-    if (!value) {
-      return;
-    }
-    setInput("");
-    try {
-      await getBridge().sendBrowserText(value);
-    } catch (error) {
-      setDetail(error instanceof Error ? error.message : "消息发送失败。");
-      setStatus("error");
-    }
-  };
-
-  const answerConfirmation = async (answer: "是" | "否") => {
-    if (bridge.current) {
+  // One-shot hydration so the panel is populated before the first SSE frame.
+  useEffect(() => {
+    let disposed = false;
+    void (async () => {
       try {
-        await bridge.current.sendBrowserConfirmationAnswer(answer);
-      } catch (error) {
-        setDetail(error instanceof Error ? error.message : "确认发送失败。");
-        setStatus("error");
+        const response = await fetch(`/api/airi/v1/companions/${COMPANION_ID}/state`);
+        if (!response.ok || disposed) {
+          return;
+        }
+        const snapshot = await response.json() as Record<string, unknown>;
+        const state = snapshot.state as Record<string, unknown> | undefined;
+        if (state) {
+          const world = state.world as Record<string, unknown> | undefined;
+          setGame({
+            health: typeof state.health === "number" ? state.health : null,
+            hunger: typeof state.hunger === "number" ? state.hunger : null,
+            sanity: typeof state.sanity === "number" ? state.sanity : null,
+            temperature: typeof state.temperature === "number" ? state.temperature : null,
+            phase: typeof world?.phase === "string" ? world.phase : undefined,
+            action: typeof state.currentAction === "string" ? state.currentAction : null,
+          });
+        }
+        setGameFresh(snapshot.stateFresh === true);
+        if (snapshot.activeCommand && typeof snapshot.activeCommand === "object") {
+          setActiveCommand(snapshot.activeCommand as CommandLifecycle);
+        }
+      } catch {
+        // Hydration is best-effort; the health poll and SSE stream follow.
       }
-      return;
-    }
-    try {
-      const response = await fetch("/api/dst/v1/companions/default/player-input", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: crypto.randomUUID(), source: "browser", text: answer }),
-      });
-      if (!response.ok) {
-        throw new Error("Confirmation was not accepted.");
-      }
-      setConfirmation(null);
-    } catch (error) {
-      setDetail(error instanceof Error ? error.message : "确认发送失败。");
-    }
-  };
+    })();
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const airiIndicator = useMemo(() => {
+    if (airi.connected && airi.authenticated) return "online";
+    if (airi.connected) return "pending";
+    return "offline";
+  }, [airi.connected, airi.authenticated]);
+
+  const airiLabel = airi.connected
+    ? (airi.authenticated ? "Airi 已连接 · 已认证" : "Airi 已连接 · 未认证")
+    : (airi.configured ? "Airi 未连接" : "Airi 未配置");
 
   return (
     <main className="app-shell">
       <header className="topbar">
-        <div className="brand"><AudioLines size={20} /> <span>DST AI Companion</span></div>
-        <div className="realtime-mode" title="低推理等级优先响应速度；可在 .env 中设置 OPENAI_REALTIME_REASONING_EFFORT=high 获得更深推理和更高延迟。">
-          {realtimeMode.model ?? "Realtime"} · 推理 {realtimeMode.reasoningEffort ?? "--"}
+        <div className="brand"><Activity size={20} /> <span>DST AI 伙伴 · 状态面板</span></div>
+        <div className={`status ${airiIndicator}`}>
+          <span className="status-dot" />
+          {airi.connected ? <Wifi size={15} /> : <WifiOff size={15} />}
+          {airiLabel}
         </div>
-        {latency.length > 0 && (
-          <div className="latency-strip" aria-label="实时延迟">
-            <Timer size={14} />
-            {latency.map((entry) => (
-              <span key={entry.id}>{LATENCY_LABEL[entry.metric]} {entry.elapsedMs}ms</span>
-            ))}
-          </div>
-        )}
-        <div className={`status ${indicator}`}><span className="status-dot" />{STATUS_LABEL[status]}</div>
-        {status === "connected" ? (
-          <button className="icon-button" type="button" title="断开语音" onClick={() => void disconnect()}><MicOff size={18} /></button>
-        ) : (
-          <button className="icon-button primary" type="button" title="连接语音" onClick={() => void connect()} disabled={status === "connecting"}>
-            {status === "connecting" ? <LoaderCircle className="spin" size={18} /> : <Mic size={18} />}
-          </button>
-        )}
+        <div className="mode-tag" title="伙伴控制器模式">{airi.mode}</div>
       </header>
 
-      {detail && <div className="notice"><CircleAlert size={16} /><span>{detail}</span><button type="button" title="关闭提示" onClick={() => setDetail("")}><X size={15} /></button></div>}
-
-      {connectionDiagnostics.length > 0 && (
-        <section className="audit" aria-label="语音连接诊断">
-          {connectionDiagnostics.map((entry) => (
-            <span key={`${entry.at}-${entry.category}-${entry.stage}`} title={entry.detail}>
-              {DIAGNOSTIC_LABEL[entry.category]} · {entry.stage}
-            </span>
-          ))}
-        </section>
-      )}
+      {notice && <div className="notice"><CircleAlert size={16} /><span>{notice}</span></div>}
 
       <section className="dashboard" aria-label="游戏状态">
         <div className="metric"><span>生命</span><strong>{game.health ?? "--"}</strong></div>
@@ -282,35 +452,50 @@ function App() {
         <div className="metric"><span>理智</span><strong>{game.sanity ?? "--"}</strong></div>
         <div className="metric"><span>温度</span><strong>{game.temperature ?? "--"}</strong></div>
         <div className="state-line">
-          <span>{game.phase ?? "等待游戏状态"}</span><span>{game.action ?? "待命"}</span>
-          <span title={gameConnection.reason}>{gameConnection.fresh ? "DST 已连接" : "DST 状态不可用"}</span>
+          <span>{game.phase ?? "等待游戏状态"}</span>
+          <span>{game.action ?? "待命"}</span>
+          <span className={gameFresh ? "fresh" : "stale"}>{gameFresh ? "DST 状态新鲜" : "DST 状态不可用/过期"}</span>
         </div>
       </section>
 
-      {!gameConnection.fresh && <div className="notice"><CircleAlert size={16} /><span>{gameConnection.reason}</span></div>}
-
-      {confirmation && <section className="confirmation">
-        <CircleAlert size={18} /><span>{confirmation.prompt}</span>
-        <div className="confirmation-actions">
-          <button type="button" title="确认" onClick={() => void answerConfirmation("是")}><Check size={16} /></button>
-          <button type="button" title="取消" onClick={() => void answerConfirmation("否")}><X size={16} /></button>
-        </div>
-      </section>}
-
-      <section className="conversation" aria-live="polite">
-        {transcript.length === 0 ? <p className="empty">等待对话</p> : transcript.map((entry) => (
-          <div className={`message ${entry.role}`} key={entry.id}><span>{entry.role === "player" ? "你" : entry.role === "assistant" ? "伙伴" : "系统"}</span><p>{entry.text}</p></div>
-        ))}
+      <section className="panel" aria-label="当前动作">
+        <h2>当前动作</h2>
+        {activeCommand ? (
+          <div className="active-command">
+            <strong>{activeCommand.kind ?? "--"}</strong>
+            <span className={`badge ${toneForStatus(activeCommand.status)}`}>{statusLabel(activeCommand.status)}</span>
+            {activeCommand.progress && typeof activeCommand.progress === "object" && (
+              <span className="progress">{gatherSummary(activeCommand.progress)}</span>
+            )}
+          </div>
+        ) : <p className="empty">当前无进行中的动作</p>}
       </section>
 
-      <form className="input-row" onSubmit={(event) => { event.preventDefault(); void submit(); }}>
-        <input value={input} onChange={(event) => setInput(event.target.value)} placeholder="输入给伙伴的话" maxLength={120} aria-label="发送文字" />
-        <button type="submit" title="发送" disabled={!input.trim() || !textFallbackEnabled}><Send size={18} /></button>
-        <button type="button" className="stop" title="立即停止伙伴动作" onClick={() => void submit("stop")} disabled={!textFallbackEnabled}><CircleStop size={18} /></button>
-      </form>
+      {confirmation && (
+        <section className="confirmation" aria-label="待确认操作">
+          <CircleAlert size={18} />
+          <span>
+            {confirmation.prompt}
+            {confirmation.kind ? `（${confirmation.kind}）` : ""} —— 请在游戏内或对 Airi 说 “是/否” 回答。
+          </span>
+        </section>
+      )}
 
-      <footer className="audit" aria-label="动作记录">
-        {audit.length === 0 ? <span>动作记录为空</span> : audit.map((entry, index) => <span key={`${entry}-${index}`}>{entry}</span>)}
+      <section className="panel results" aria-label="最近结果">
+        <h2>最近结果</h2>
+        {recent.length === 0 ? <p className="empty">暂无结果</p> : (
+          <ul>
+            {recent.map((entry) => (
+              <li key={entry.key} className={entry.tone}>{entry.label}</li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <footer className="diagnostics" aria-label="诊断">
+        <span className={sseConnected ? "fresh" : "stale"}>{sseConnected ? "事件流已连接" : "事件流重连中"}</span>
+        <span>控制器活跃：{airi.lastActivity ? new Date(airi.lastActivity).toLocaleTimeString() : "--"}</span>
+        <span className="audit-tail">{audit.length === 0 ? "审计为空" : audit.join(" · ")}</span>
       </footer>
     </main>
   );

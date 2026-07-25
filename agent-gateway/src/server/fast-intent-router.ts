@@ -1,4 +1,11 @@
-import type { CommandKind, CompanionState, GatherScope, NearbyEntity } from "../shared/types.js";
+import type { CommandKind, CompanionState, GatherMode, GatherScope, NearbyEntity } from "../shared/types.js";
+import {
+  findGatherVerb,
+  findResourceMatches,
+  normalizePrefab,
+  type ResourceDefinition,
+  type TextSpan,
+} from "../shared/resource-lexicon.js";
 import { MAX_FOLLOW_DISTANCE, MAX_MOVEMENT_DISTANCE, hasFreshState, isGatherTargetAvailable } from "./validation.js";
 
 export type FastIntentName = "stop" | "follow" | "approach" | "gather_resource";
@@ -25,21 +32,11 @@ export interface FastIntentBlock {
 
 export type FastIntentResult = FastIntentMatch | FastIntentBlock | { status: "none" };
 
-interface ResourceIntent {
-  name: "grass" | "berries" | "twigs";
-  tokens: string[];
-  prefabs: string[];
-}
-
-interface TextSpan {
-  start: number;
-  end: number;
-}
-
 interface FastIntentTextCandidate {
   intent: FastIntentName;
   span: TextSpan;
-  resource?: ResourceIntent;
+  resource?: ResourceDefinition;
+  mode?: GatherMode;
   scope?: GatherScope;
 }
 
@@ -48,39 +45,20 @@ type FastIntentTextAnalysis =
   | FastIntentBlock
   | { status: "none" };
 
-const RESOURCE_INTENTS: ResourceIntent[] = [
-  {
-    name: "grass",
-    tokens: ["草", "干草", "grass"],
-    prefabs: ["grass"],
-  },
-  {
-    name: "berries",
-    tokens: ["浆果", "莓果", "berries", "berry"],
-    prefabs: ["berrybush", "berrybush_juicy", "berrybush2"],
-  },
-  {
-    name: "twigs",
-    tokens: ["树枝", "小树枝", "twigs", "twig"],
-    prefabs: ["sapling", "sapling_moon"],
-  },
-];
-
-const GATHER_VERBS = ["采集", "收集", "采", "捡", "拾", "摘", "拿", "gather", "collect", "pick"];
-const ALL_TOKENS = ["所有", "全部", "全都", "都", "all", "every"];
+const ALL_TOKENS = ["所有", "全部", "全都", "都", "统统", "all", "every"];
 const RESIDUAL_EDGE_PUNCTUATION = /(?:^[\s,.;:!?，。！？、]+|[\s,.;:!?，。！？、]+$)/g;
 const RESIDUAL_LEADING_ENGLISH = /^(?:please|pls|kindly|can you|could you|would you|and|then|also|plus)\b[\s,.;:!?，。！？、]*/i;
 const RESIDUAL_TRAILING_ENGLISH = /[\s,.;:!?，。！？、]*(?:and|then|also|plus)$/i;
 const RESIDUAL_LEADING_CHINESE = /^(?:请|麻烦|帮我|帮忙|劳驾|然后|再|顺便|并且|和|以及|还有|把|给我|去|了|吧|一下|都|全部|所有)[\s,.;:!?，。！？、]*/u;
 const RESIDUAL_TRAILING_CHINESE = /[\s,.;:!?，。！？、]*(?:然后|再|顺便|并且|和|以及|还有|把|给我|去|了|吧|一下|都|全部|所有)$/u;
-const HIGH_RISK_TEXT = /攻击|打(?:一下|死)?|杀|砍(?:他|它)?|喂|吃|装备|穿|丢|drop|attack|kill|hit|fight|feed|eat|equip/i;
+const HIGH_RISK_TEXT = /攻击|打(?:一下|死)?|杀|喂|吃|装备|穿|丢|drop|attack|kill|hit|fight|feed|eat|equip/i;
 
 const STOP_PATTERNS = [
   /\b(?:stop|cancel|halt)\b/i,
   /\b(?:wait there|wait here|hold position|hold still)\b/i,
   /停止|停下|停一停|停一下|先停|别动|不要动|站住|别跟|不要跟|不跟了/u,
-  /(?:别|不要|不用)(?:再)?(?:采|采集|收集|捡|拾|摘|拿)/u,
-  /\bstop\s+(?:gathering|collecting|picking)\b/i,
+  /(?:别|不要|不用)(?:再)?(?:采|采集|收集|捡|拾|摘|拿|砍|挖)/u,
+  /\bstop\s+(?:gathering|collecting|picking|chopping|mining)\b/i,
 ];
 const FOLLOW_PATTERNS = [
   /跟着我|跟随我|跟我|跟上|跟紧|随我/u,
@@ -154,7 +132,14 @@ export class FastIntentRouter {
     }
 
     if (textRoute.candidate.intent === "gather_resource" && textRoute.candidate.resource) {
-      return routeGatherIntent(textRoute.candidate.resource, textRoute.candidate.scope ?? "single", state, now, residualText);
+      return routeGatherIntent(
+        textRoute.candidate.resource,
+        textRoute.candidate.mode ?? textRoute.candidate.resource.mode,
+        textRoute.candidate.scope ?? "single",
+        state,
+        now,
+        residualText,
+      );
     }
 
     return { status: "none" };
@@ -185,19 +170,22 @@ function analyzeIntentText(rawText: string, normalizedText: string): FastIntentT
 }
 
 function routeGatherIntent(
-  resource: ResourceIntent,
+  resource: ResourceDefinition,
+  mode: GatherMode,
   scope: GatherScope,
   state: CompanionState | undefined,
   now: number,
   residualText: string,
 ): FastIntentResult {
+  // Only freshness gates the deterministic path now. Whether a matching entity
+  // is currently within the reported nearby radius is decided by the Lua brain,
+  // which searches a wider radius and walks the companion to the resource. This
+  // removes the old "识别不到/太远" dead-end for resources just out of range.
   if (!hasFreshState(state, now)) {
     return { status: "blocked", intent: "gather_resource", reason: "stale_state" };
   }
-  const target = nearestCollectableTarget(state, resource.prefabs);
-  if (!target) {
-    return { status: "blocked", intent: "gather_resource", reason: "target_unavailable" };
-  }
+  const targetPrefab = normalizePrefab(resource.prefabs[0]);
+  const visible = nearestInFamilyTarget(state, resource, mode);
   return {
     status: "matched",
     intent: "gather_resource",
@@ -205,10 +193,10 @@ function routeGatherIntent(
     command: {
       kind: "gather_nearby",
       args: {
-        mode: "collect",
+        mode,
         scope,
-        targetGuid: target.guid,
-        targetPrefab: normalizePrefabName(target.prefab),
+        targetPrefab,
+        ...(visible ? { targetGuid: visible.guid } : {}),
       },
     },
     ...(residualText ? { residualText } : {}),
@@ -241,27 +229,29 @@ function findApproachCandidate(rawText: string, normalizedText: string): FastInt
 
 function findGatherCandidate(
   rawText: string,
-  normalizedText: string,
+  _normalizedText: string,
 ): { status: "matched"; candidate: FastIntentTextCandidate } | FastIntentBlock | { status: "none" } {
-  const verb = firstTokenSpan(rawText, GATHER_VERBS);
+  const verb = findGatherVerb(rawText);
   if (!verb) {
     return { status: "none" };
   }
-  const resources = RESOURCE_INTENTS
-    .map((resource) => ({ resource, span: firstTokenSpan(rawText, resource.tokens) }))
-    .filter((entry): entry is { resource: ResourceIntent; span: TextSpan } => Boolean(entry.span));
+  const resources = findResourceMatches(rawText, verb.mode);
   if (resources.length !== 1) {
+    // A gather verb with zero or several distinct resources needs a concise
+    // model clarification, e.g. "采集" alone or "采草和树枝".
     return { status: "blocked", intent: "gather_resource", reason: "ambiguous_intent" };
   }
+  const match = resources[0]!;
   const allToken = firstTokenSpan(rawText, ALL_TOKENS);
-  const span = coveringSpan([verb, resources[0]!.span, ...(allToken ? [allToken] : [])]);
+  const span = coveringSpan([verb.span, match.span, ...(allToken ? [allToken] : [])]);
   return {
     status: "matched",
     candidate: {
       intent: "gather_resource",
       span,
-      resource: resources[0]!.resource,
-      scope: containsAny(normalizedText, ALL_TOKENS) ? "all_same_prefab" : "single",
+      resource: match.resource,
+      mode: match.mode,
+      scope: allToken ? "all_same_prefab" : "single",
     },
   };
 }
@@ -269,7 +259,7 @@ function findGatherCandidate(
 function normalizeInputText(value: string): string {
   return value
     .toLowerCase()
-    .replace(/[\u3000\s]+/g, " ")
+    .replace(/[　\s]+/g, " ")
     .replace(/[，。！？、,.!?;:]/g, " ")
     .trim();
 }
@@ -279,7 +269,7 @@ function residualAfterRemovingSpan(text: string, span: TextSpan): string {
 }
 
 function normalizeResidualText(value: string): string {
-  let text = value.replace(/[\u3000\s]+/g, " ").replace(RESIDUAL_EDGE_PUNCTUATION, "").trim();
+  let text = value.replace(/[　\s]+/g, " ").replace(RESIDUAL_EDGE_PUNCTUATION, "").trim();
   let previous = "";
   while (text && text !== previous) {
     previous = text;
@@ -301,8 +291,8 @@ function isStopIntent(text: string): boolean {
   return /(^|\s)(stop|cancel|halt)(\s|$)/.test(text)
     || /(^|\s)(?:wait there|wait here|hold position|hold still)(\s|$)/.test(text)
     || /停止|停下|停一停|停一下|先停|别动|不要动|站住|别跟|不要跟|不跟了/.test(text)
-    || /(?:别|不要|不用)(?:再)?(?:采|采集|收集|捡|拾|摘|拿)/.test(text)
-    || /(^|\s)stop (?:gathering|collecting|picking)(\s|$)/.test(text);
+    || /(?:别|不要|不用)(?:再)?(?:采|采集|收集|捡|拾|摘|拿|砍|挖)/.test(text)
+    || /(^|\s)stop (?:gathering|collecting|picking|chopping|mining)(\s|$)/.test(text);
 }
 
 function isFollowIntent(text: string): boolean {
@@ -316,10 +306,6 @@ function isFollowIntent(text: string): boolean {
 function isApproachIntent(text: string): boolean {
   return /过来|靠近我|靠过来|来我这|来我这里|到我这|到我这里/.test(text)
     || /(^|\s)(come here|come to me|approach me)(\s|$)/.test(text);
-}
-
-function containsAny(text: string, tokens: string[]): boolean {
-  return tokens.some((token) => text.includes(token));
 }
 
 function addCandidate(candidates: FastIntentTextCandidate[], candidate: FastIntentTextCandidate | undefined): void {
@@ -377,21 +363,21 @@ function spansOverlap(left: TextSpan, right: TextSpan): boolean {
 }
 
 function isGatherStopIntent(text: string): boolean {
-  return /(?:别|不要|不用)(?:再)?(?:采|采集|收集|捡|拾|摘|拿)/.test(text)
-    || /(^|\s)stop (?:gathering|collecting|picking)(\s|$)/.test(text);
+  return /(?:别|不要|不用)(?:再)?(?:采|采集|收集|捡|拾|摘|拿|砍|挖)/.test(text)
+    || /(^|\s)stop (?:gathering|collecting|picking|chopping|mining)(\s|$)/.test(text);
 }
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function nearestCollectableTarget(state: CompanionState, prefabs: string[]): NearbyEntity | undefined {
-  const allowed = new Set(prefabs);
+function nearestInFamilyTarget(
+  state: CompanionState,
+  resource: ResourceDefinition,
+  mode: GatherMode,
+): NearbyEntity | undefined {
+  const allowed = new Set(resource.prefabs.map(normalizePrefab));
   return state.nearby
-    .filter((entity) => allowed.has(normalizePrefabName(entity.prefab)) && isGatherTargetAvailable(state, entity, "collect"))
+    .filter((entity) => allowed.has(normalizePrefab(entity.prefab)) && isGatherTargetAvailable(state, entity, mode))
     .sort((left, right) => left.distance - right.distance || left.guid - right.guid)[0];
-}
-
-function normalizePrefabName(value: unknown): string {
-  return typeof value === "string" ? value.trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
 }
