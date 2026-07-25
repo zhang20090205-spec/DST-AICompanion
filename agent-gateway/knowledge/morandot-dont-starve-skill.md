@@ -57,7 +57,7 @@ after a trusted failed result, never as a guess.
 | 草 / 干草 / grass | collect | grass |
 | 浆果 / 莓果 / berries (含 姜果/桨果 等口误) | collect | berrybush, berrybush2, berrybush_juicy |
 | 树枝 / 小树枝 / 树苗 / twigs | collect | sapling, sapling_moon |
-| 胡萝卜 / carrot | collect | carrot |
+| 胡萝卜 / carrot | collect | carrot, carrot_planted |
 | 芦苇 / reeds | collect | reeds |
 | 花 / flower | collect | flower, flower_evil |
 | 树 / 常青树 / 桦树 / 多枝树 / tree | chop | evergreen, evergreen_sparse, deciduoustree, twiggytree |

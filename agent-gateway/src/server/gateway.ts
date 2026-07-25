@@ -1045,6 +1045,14 @@ export class GatewayCore {
         this.seenInputIds.delete(id);
       }
     }
+    // Browser/dashboard sessions were previously only pruned when their exact
+    // id was presented again; a page that reconnects with a fresh id left the
+    // old entry to linger for the life of the process. Sweep expired ones here.
+    for (const [id, session] of this.browserSessions) {
+      if (session.expiresAt <= now) {
+        this.browserSessions.delete(id);
+      }
+    }
     this.expireRealtimeToolResults(now);
   }
 

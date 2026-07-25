@@ -33,7 +33,9 @@ export async function createRealtimeClientSecret(
     }
     headers["OpenAI-Safety-Identifier"] = safetyIdentifier;
   }
-  const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
+  let response: Response;
+  try {
+    response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",
     headers,
     body: JSON.stringify({
@@ -68,7 +70,17 @@ export async function createRealtimeClientSecret(
         },
       },
     }),
-  });
+    });
+  } catch (error) {
+    // A thrown fetch (DNS failure, TLS error, connection refused/timeout —
+    // common on networks that cannot reach api.openai.com without a proxy)
+    // must surface as a clear, actionable ValidationError (HTTP 400) instead
+    // of an opaque 500. The reason is sanitized to strip any secret material.
+    const reason = sanitizeOpenAIErrorDetail(error instanceof Error ? error.message : String(error));
+    throw new ValidationError(
+      `无法连接 OpenAI Realtime 接口${reason ? `（${reason}）` : ""}。请确认这台机器能访问 api.openai.com（中国大陆通常需要代理/VPN），并使用可创建 Realtime client secret 的标准 API Key，然后重试。`,
+    );
+  }
   if (!response.ok) {
     const detail = await readOpenAIErrorDetail(response);
     throw new ValidationError(`OpenAI Realtime client-secret request failed (${response.status})${detail ? `: ${detail}` : "."}`);

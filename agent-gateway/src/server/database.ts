@@ -15,6 +15,10 @@ interface KnowledgeDocument {
 }
 
 const UPSTREAM_COMMIT = "12dc27d3b6d0a261f0fbd14a046d492cba8c6e27";
+// The append-only audit trail is bounded so a long play session cannot grow the
+// local SQLite file without limit. Only the most recent rows are ever surfaced
+// (recentAudit caps at 100), so retaining a few thousand is more than enough.
+const AUDIT_RETENTION_ROWS = 2000;
 const KNOWLEDGE_DOCUMENTS: readonly KnowledgeDocument[] = [{
   fileName: "morandot-dont-starve-skill.md",
   title: "DST survival decision guide",
@@ -89,6 +93,10 @@ export class GatewayStore {
     const safeMetadata = JSON.stringify(metadata, (_key, value) => typeof value === "string" ? value.slice(0, 160) : value);
     this.db.prepare("INSERT INTO action_audit (occurred_at, companion_id, event, metadata) VALUES (?, ?, ?, ?)")
       .run(Date.now(), companionId, event.slice(0, 64), safeMetadata);
+    // Trim old rows so the audit table stays bounded. id is the autoincrement
+    // primary key, so this is an indexed range delete and cheap to run inline.
+    this.db.prepare("DELETE FROM action_audit WHERE id <= (SELECT MAX(id) FROM action_audit) - ?")
+      .run(AUDIT_RETENTION_ROWS);
   }
 
   recentAudit(limit = 20): Array<{ occurredAt: number; companionId: string; event: string; metadata: Record<string, unknown> }> {
