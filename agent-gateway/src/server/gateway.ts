@@ -6,6 +6,7 @@ import type {
   CommandResult,
   CommandStatus,
   CompanionState,
+  GatherProgress,
   PendingConfirmation,
   PlayerInput,
 } from "../shared/types.js";
@@ -19,6 +20,7 @@ import {
   sanitizeChat,
   targetFromState,
   validateCommandArgs,
+  validateCommandResult,
 } from "./validation.js";
 
 export interface GatewayEvent {
@@ -42,12 +44,19 @@ interface CommandLifecycleRecord {
   dispatchedAt?: number;
   startedAt?: number;
   completedAt?: number;
+  progress?: GatherProgress;
   result?: CommandResult;
 }
 
 interface CommandWaiter {
   resolve: (record: CommandLifecycleRecord) => void;
   timer: ReturnType<typeof setTimeout>;
+}
+
+interface PendingTrustedGatherMessage {
+  status: "succeeded" | "partial";
+  outcome: GatherProgress;
+  text: string;
 }
 
 interface CompanionContext {
@@ -58,6 +67,8 @@ interface CompanionContext {
   active?: CommandRecord;
   commandLifecycles: Map<string, CommandLifecycleRecord>;
   commandWaiters: Map<string, Set<CommandWaiter>>;
+  pendingTrustedGatherMessages: PendingTrustedGatherMessage[];
+  trustedGatherSpeechCommandIds: Set<string>;
   confirmation?: PendingConfirmation;
   voiceConnected: boolean;
   voiceSpeaking: boolean;
@@ -131,8 +142,8 @@ const ORDINARY_TRANSFER_PREFABS = new Set([
 
 const ASSISTANT_SPEECH_RATE_LIMIT_MS = 750;
 const ASSISTANT_SPEECH_DUPLICATE_WINDOW_MS = 10_000;
+const INTERMEDIATE_ASSISTANT_ACKNOWLEDGEMENT = /^(?:我(?:已经)?明白了?|我去处理一下|马上(?:完成|处理)|i (?:already )?understand(?:[.!！。]|$)|i(?:'|’)ll (?:handle|take care))/i;
 const COMMAND_LIFECYCLE_RETENTION_MS = 5 * 60_000;
-const REALTIME_TOOL_RESULT_WAIT_MS = 1_200;
 const MAX_COMMAND_WAIT_MS = 10_000;
 
 const REALTIME_TOOLS = new Set([
@@ -223,6 +234,7 @@ export class GatewayCore {
   pollCommands(companionId: string): { epoch: number; commands: Command[] } {
     const context = this.context(companionId);
     this.expire(context);
+    this.flushTrustedGatherMessages(context);
     if (context.active) {
       return { epoch: context.epoch, commands: [] };
     }
@@ -257,31 +269,61 @@ export class GatewayCore {
     if (!active || active.command.id !== result.id) {
       return { accepted: false, duplicate: true };
     }
-    if (result.status === "started") {
+    const safeResult = validateCommandResult(result);
+    this.assertResultMatchesCommand(active.command, safeResult);
+
+    if (safeResult.status === "started") {
       if (active.started) {
         return { accepted: true, duplicate: true };
       }
       active.started = true;
-      this.updateCommandLifecycle(context, active.command, "started", result);
+      this.updateCommandLifecycle(context, active.command, "started", safeResult);
+    } else if (safeResult.status === "progress") {
+      active.started = true;
+      this.updateCommandLifecycle(context, active.command, "progress", safeResult);
     }
-    this.store.addAudit(companionId, `command_${result.status}`, {
-      id: result.id,
+    this.store.addAudit(companionId, `command_${safeResult.status}`, {
+      id: safeResult.id,
       kind: active.command.kind,
-      reason: result.reason,
-      stateRevision: result.stateRevision,
+      reason: safeResult.reason,
+      stateRevision: safeResult.stateRevision,
+      outcome: safeResult.outcome ?? null,
     });
-    if (result.status !== "started") {
-      this.updateCommandLifecycle(context, active.command, result.status, result);
+    if (safeResult.status === "progress") {
+      this.store.setCompanionMemory(companionId, "current_goal", JSON.stringify({
+        kind: active.command.kind,
+        state: "progress",
+        epoch: active.command.epoch,
+      }));
+      this.publish({
+        type: "command-progress",
+        companionId,
+        data: {
+          result: safeResult,
+          progress: safeResult.outcome?.gather ?? null,
+          kind: active.command.kind,
+          lifecycle: this.publicCommandLifecycle(context.commandLifecycles.get(safeResult.id)),
+        },
+      });
+      return { accepted: true, duplicate: false };
+    }
+    if (this.isTerminalCommandStatus(safeResult.status)) {
+      this.updateCommandLifecycle(context, active.command, safeResult.status, safeResult);
       context.active = undefined;
       this.store.setCompanionMemory(companionId, "current_goal", JSON.stringify({ state: "idle" }));
       this.store.setCompanionMemory(companionId, "task_summary", JSON.stringify({
         kind: active.command.kind,
-        status: result.status,
+        status: safeResult.status,
       }));
+      this.queueTrustedGatherTerminalMessage(context, active.command, safeResult);
+      this.flushTrustedGatherMessages(context);
+      if (active.command.kind === "say_in_game") {
+        context.trustedGatherSpeechCommandIds.delete(safeResult.id);
+      }
       this.publish({
         type: "command-result",
         companionId,
-        data: { result, kind: active.command.kind, lifecycle: this.publicCommandLifecycle(context.commandLifecycles.get(result.id)) },
+        data: { result: safeResult, kind: active.command.kind, lifecycle: this.publicCommandLifecycle(context.commandLifecycles.get(safeResult.id)) },
       });
     }
     return { accepted: true, duplicate: false };
@@ -472,7 +514,7 @@ export class GatewayCore {
       priority,
       kind,
       args: commandArgs,
-      expiresAt: boundedExpiry(now, undefined, kind),
+      expiresAt: boundedExpiry(now, undefined, kind, args),
     };
     const record = { command, queuedAt: now };
     current.queue.push(record);
@@ -488,10 +530,10 @@ export class GatewayCore {
 
   requestConfirmation(companionId: string, kind: CommandKind, rawArgs: unknown, prompt: unknown): PendingConfirmation {
     const context = this.context(companionId);
-    if (kind === "clear_action_queue" || kind === "stop_and_wait") {
-      throw new ValidationError("This action does not need confirmation.");
-    }
     const args = validateCommandArgs(kind, rawArgs, context.state);
+    if (!this.requiresConfirmation(kind, args, context.state)) {
+      throw new ValidationError("This action does not require player confirmation.");
+    }
     const now = Date.now();
     const confirmation: PendingConfirmation = {
       id: randomUUID(),
@@ -597,16 +639,32 @@ export class GatewayCore {
       this.interrupt(companionId, "tool_stop_and_wait");
     }
     if (kind === "say_in_game") {
-      const command = this.enqueueAssistantSpeech(context, sanitizeChat(args.text));
+      const text = sanitizeChat(args.text);
+      if (INTERMEDIATE_ASSISTANT_ACKNOWLEDGEMENT.test(text)) {
+        return {
+          output: {
+            accepted: false,
+            deferred: true,
+            reason: "Intermediate acknowledgements are suppressed. Execute the requested game action first and wait for its trusted terminal result.",
+          },
+        };
+      }
+      if (this.hasGameplayWork(context) || this.hasTrustedGatherSpeechPending(context)) {
+        return {
+          output: {
+            accepted: false,
+            deferred: true,
+            reason: "A gameplay command or its trusted result report is pending. Do not speak in game until the trusted lifecycle is finished.",
+          },
+        };
+      }
+      const command = this.enqueueAssistantSpeech(context, text);
       if (!command) {
         return { output: { accepted: true, duplicate: true } };
       }
       return { output: this.realtimeCommandOutput(companionId, command, false), command };
     }
     const command = this.enqueue(companionId, kind, args, "player");
-    if (context.state && Date.now() - context.state.receivedAt <= 5_000) {
-      await this.waitForCommandTerminal(companionId, command.id, REALTIME_TOOL_RESULT_WAIT_MS);
-    }
     return { output: this.realtimeCommandOutput(companionId, command), command };
   }
 
@@ -700,6 +758,8 @@ export class GatewayCore {
         queue: [],
         commandLifecycles: new Map<string, CommandLifecycleRecord>(),
         commandWaiters: new Map<string, Set<CommandWaiter>>(),
+        pendingTrustedGatherMessages: [],
+        trustedGatherSpeechCommandIds: new Set<string>(),
         voiceConnected: false,
         voiceSpeaking: false,
         voiceOfflineStandby: true,
@@ -737,6 +797,7 @@ export class GatewayCore {
         context.commandLifecycles.delete(id);
       }
     }
+    this.flushTrustedGatherMessages(context);
   }
 
   private rememberCommandLifecycle(context: CompanionContext, record: CommandRecord): void {
@@ -769,10 +830,13 @@ export class GatewayCore {
       record.dispatchedAt = record.dispatchedAt ?? now;
     } else if (status === "started") {
       record.startedAt = record.startedAt ?? now;
+    } else if (status === "progress") {
+      record.startedAt = record.startedAt ?? now;
+      record.progress = result?.outcome?.gather;
     } else if (this.isTerminalCommandStatus(status)) {
       record.completedAt = now;
     }
-    if (result) {
+    if (result && this.isTerminalCommandStatus(status)) {
       record.result = result;
     }
     this.publishCommandLifecycle(context, command.id);
@@ -798,6 +862,9 @@ export class GatewayCore {
       reason,
     });
     this.updateCommandLifecycle(context, record.command, "cancelled", result);
+    if (record.command.kind === "say_in_game") {
+      context.trustedGatherSpeechCommandIds.delete(record.command.id);
+    }
     this.publish({
       type: "command-result",
       companionId: context.id,
@@ -839,6 +906,7 @@ export class GatewayCore {
       dispatchedAt: record.dispatchedAt ?? null,
       startedAt: record.startedAt ?? null,
       completedAt: record.completedAt ?? null,
+      progress: record.progress ?? null,
       result: record.result ?? null,
     };
   }
@@ -880,8 +948,119 @@ export class GatewayCore {
     };
   }
 
-  private isTerminalCommandStatus(status: CommandLifecycleStatus): status is "succeeded" | "failed" | "cancelled" {
-    return status === "succeeded" || status === "failed" || status === "cancelled";
+  private assertResultMatchesCommand(command: Command, result: CommandResult): void {
+    const gather = result.outcome?.gather;
+    if (command.kind !== "gather_nearby") {
+      if (result.status === "progress" || result.status === "partial") {
+        throw new ValidationError("Only gather_nearby may report progress or partial completion.");
+      }
+      if (gather) {
+        throw new ValidationError("Only gather_nearby may include a gather outcome.");
+      }
+      return;
+    }
+
+    const requiresGatherOutcome = result.status === "progress"
+      || result.status === "partial"
+      || result.status === "succeeded";
+    if (requiresGatherOutcome && !gather) {
+      throw new ValidationError("Gather progress and successful terminal results require a gather outcome.");
+    }
+    if (result.status === "started" && gather) {
+      throw new ValidationError("A started gather result must not include an outcome.");
+    }
+    if (!gather) {
+      return;
+    }
+
+    const expectedScope = command.args.scope === "all_same_prefab" ? "all_same_prefab" : "single";
+    const expectedMode = command.args.mode === "chop" || command.args.mode === "mine" ? command.args.mode : "collect";
+    const expectedPrefab = typeof command.args.targetPrefab === "string"
+      ? normalizePrefabName(command.args.targetPrefab)
+      : "";
+    if (
+      gather.scope !== expectedScope
+      || gather.mode !== expectedMode
+      || !expectedPrefab
+      || gather.targetPrefab !== expectedPrefab
+    ) {
+      throw new ValidationError("Gather outcome does not match the canonical queued gather command.");
+    }
+    if (gather.scope === "single" && gather.attempted > 1) {
+      throw new ValidationError("A single-target gather result may only describe one target.");
+    }
+    if (result.status === "succeeded" && (gather.remaining !== 0 || gather.skipped !== 0)) {
+      throw new ValidationError("Gather cannot report succeeded while targets remain or were skipped.");
+    }
+    if (result.status === "succeeded" && gather.completed === 0) {
+      throw new ValidationError("Gather cannot report succeeded without completing a target.");
+    }
+    if (result.status === "partial" && gather.remaining === 0 && gather.skipped === 0) {
+      throw new ValidationError("Gather partial completion requires a remaining or skipped target.");
+    }
+  }
+
+  private queueTrustedGatherTerminalMessage(
+    context: CompanionContext,
+    command: Command,
+    result: CommandResult,
+  ): void {
+    const outcome = result.outcome?.gather;
+    if (
+      command.kind !== "gather_nearby"
+      || !outcome
+      || (result.status !== "succeeded" && result.status !== "partial")
+    ) {
+      return;
+    }
+    const text = result.status === "succeeded"
+      ? `附近 ${outcome.targetPrefab}：采集 ${outcome.completed} 个，剩余 0。`
+      : `附近 ${outcome.targetPrefab}：采集 ${outcome.completed} 个，剩余 ${outcome.remaining}，跳过 ${outcome.skipped}。`;
+    const message: PendingTrustedGatherMessage = { status: result.status, outcome, text };
+    context.pendingTrustedGatherMessages.push(message);
+    if (this.hasGameplayWork(context)) {
+      this.publish({
+        type: "trusted-gather-message",
+        companionId: context.id,
+        data: { status: message.status, outcome: { gather: message.outcome }, deferred: true },
+      });
+    }
+  }
+
+  private flushTrustedGatherMessages(context: CompanionContext): void {
+    if (this.hasGameplayWork(context)) {
+      return;
+    }
+    while (context.pendingTrustedGatherMessages.length > 0) {
+      const message = context.pendingTrustedGatherMessages.shift()!;
+      const command = this.enqueue(context.id, "say_in_game", { text: message.text }, "player");
+      context.trustedGatherSpeechCommandIds.add(command.id);
+      this.publish({
+        type: "trusted-gather-message",
+        companionId: context.id,
+        data: {
+          status: message.status,
+          outcome: { gather: message.outcome },
+          deferred: false,
+          command,
+        },
+      });
+    }
+  }
+
+  private hasGameplayWork(context: CompanionContext): boolean {
+    return Boolean(
+      (context.active && context.active.command.kind !== "say_in_game")
+      || context.queue.some((record) => record.command.kind !== "say_in_game"),
+    );
+  }
+
+  private hasTrustedGatherSpeechPending(context: CompanionContext): boolean {
+    return context.pendingTrustedGatherMessages.length > 0 || context.trustedGatherSpeechCommandIds.size > 0;
+  }
+
+  private isTerminalCommandStatus(status: CommandLifecycleStatus): status is "succeeded" | "partial" | "failed" | "cancelled" {
+    return status === "succeeded" || status === "partial" || status === "failed" || status === "cancelled";
   }
 
   private requiresConfirmation(kind: CommandKind, args: Record<string, unknown>, state: CompanionState | undefined): boolean {
@@ -900,6 +1079,9 @@ export class GatewayCore {
   }
 
   private enqueueAssistantSpeech(context: CompanionContext, text: string): Command | undefined {
+    if (this.hasGameplayWork(context)) {
+      return undefined;
+    }
     const now = Date.now();
     const last = context.lastAssistantSpeech;
     if (last && (

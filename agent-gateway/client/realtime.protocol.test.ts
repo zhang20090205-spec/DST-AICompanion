@@ -16,6 +16,7 @@ import {
 interface BridgeInternals {
   session?: { sessionId: string };
   channel?: { readyState: string; send: (payload: string) => void };
+  audio?: { muted: boolean };
   handleRealtimeEvent: (raw: unknown) => Promise<void>;
   connectEventStream: () => void;
 }
@@ -31,6 +32,11 @@ function createBridge(): RealtimeBridge {
 test("the browser session update exposes only the approved tool surface", () => {
   const update = buildSessionUpdate();
   assert.equal(update.type, "session.update");
+  assert.deepEqual(update.session.output_modalities, ["audio"]);
+  assert.deepEqual(update.session.audio.input.transcription, {
+    model: "gpt-4o-mini-transcribe",
+    language: "zh",
+  });
   assert.equal(update.session.audio.input.turn_detection.interrupt_response, true);
   assert.deepEqual(REALTIME_TOOLS.map((tool) => tool.name), [
     "get_game_state", "search_dst_knowledge", "say_in_game", "follow_player", "stop_and_wait",
@@ -99,7 +105,7 @@ test("function call output is always a JSON string payload", () => {
   });
 });
 
-test("VAD only marks speaking, while stop transcripts interrupt the game action queue", async (t) => {
+test("VAD immediately interrupts game work and output before its transcript arrives", async (t) => {
   const originalFetch = globalThis.fetch;
   const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   const posted: Array<{ path: string; body: Record<string, unknown> }> = [];
@@ -127,7 +133,9 @@ test("VAD only marks speaking, while stop transcripts interrupt the game action 
     transcript: "危险，快停下！",
   }));
 
-  assert.deepEqual(posted.map((request) => request.body.type), ["voice-speaking", "transcript", "interrupt"]);
+  assert.equal(posted.filter((request) => request.body.type === "interrupt").length, 1);
+  assert.equal(posted.some((request) => request.body.type === "voice-speaking"), true);
+  assert.equal(posted.some((request) => request.body.type === "transcript"), true);
   assert.equal(posted.every((request) => request.path === "/api/realtime/events"), true);
   assert.equal(posted.every((request) => request.body.sessionId === "local-session" && request.body.companionId === "bot-1"), true);
 });
@@ -176,6 +184,140 @@ test("Realtime tool calls reach the Gateway but raw assistant audio transcripts 
     item: { type: "function_call_output", call_id: "call-follow", output: "{\"accepted\":true}" },
   });
   assert.deepEqual(sent[1], { type: "response.create" });
+});
+
+test("pending gameplay tools suppress assistant output until one trusted terminal result", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalEventSource = Object.getOwnPropertyDescriptor(globalThis, "EventSource");
+  const sent: Array<Record<string, unknown>> = [];
+  const transcripts: Array<{ role: string; text: string }> = [];
+
+  class FakeEventSource {
+    static instance?: FakeEventSource;
+    onerror?: () => void;
+    readonly listeners = new Map<string, Array<(message: MessageEvent<string>) => void>>();
+
+    constructor(_url: string) {
+      FakeEventSource.instance = this;
+    }
+
+    addEventListener(type: string, listener: (message: MessageEvent<string>) => void): void {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+    }
+
+    close(): void {}
+
+    emit(type: string, event: unknown): void {
+      for (const listener of this.listeners.get(type) ?? []) {
+        listener({ data: JSON.stringify(event) } as MessageEvent<string>);
+      }
+    }
+  }
+
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    output: JSON.stringify({
+      accepted: true,
+      commandId: "cmd-gather",
+      kind: "gather_nearby",
+      status: "queued",
+      terminal: false,
+      pending: true,
+      waitRecommended: true,
+    }),
+  }), { status: 200 })) as typeof fetch;
+  Object.defineProperty(globalThis, "EventSource", { configurable: true, value: FakeEventSource });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalEventSource) {
+      Object.defineProperty(globalThis, "EventSource", originalEventSource);
+    } else {
+      Reflect.deleteProperty(globalThis, "EventSource");
+    }
+  });
+
+  const bridge = new RealtimeBridge({
+    onStatus: () => undefined,
+    onTranscript: (entry) => transcripts.push({ role: entry.role, text: entry.text }),
+    onGatewayEvent: () => undefined,
+  }, "bot-1") as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+  bridge.connectEventStream();
+
+  await bridge.handleRealtimeEvent(JSON.stringify({
+    type: "response.function_call_arguments.done",
+    call_id: "call-gather",
+    name: "gather_nearby",
+    arguments: "{}",
+  }));
+  await bridge.handleRealtimeEvent(JSON.stringify({ type: "response.output_audio_transcript.done", transcript: "I will gather them now." }));
+
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 0);
+  assert.equal(sent.filter((event) => event.type === "response.cancel").length, 0);
+  assert.deepEqual(transcripts, []);
+
+  FakeEventSource.instance!.emit("command-result", {
+    type: "command-result",
+    companionId: "bot-1",
+    data: {
+      kind: "gather_nearby",
+      result: {
+        id: "cmd-gather",
+        status: "succeeded",
+        stateRevision: 4,
+        outcome: {
+          gather: {
+            scope: "all_same_prefab",
+            mode: "collect",
+            targetPrefab: "berries",
+            attempted: 3,
+            completed: 3,
+            remaining: 0,
+            skipped: 0,
+          },
+        },
+      },
+    },
+  });
+  FakeEventSource.instance!.emit("command-result", {
+    type: "command-result",
+    companionId: "bot-1",
+    data: { kind: "gather_nearby", result: { id: "cmd-gather", status: "succeeded", stateRevision: 4 } },
+  });
+
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 1);
+  assert.equal(sent.filter((event) => event.type === "conversation.item.create").length, 2);
+});
+
+test("same-turn gameplay tools are posted before a say_in_game preamble", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const posted: Array<Record<string, unknown>> = [];
+  const sent: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_path, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    posted.push(body);
+    const output = body.name === "gather_nearby"
+      ? { accepted: true, commandId: "cmd-gather", kind: "gather_nearby", pending: true, waitRecommended: true }
+      : { accepted: false, deferred: true };
+    return new Response(JSON.stringify({ output: JSON.stringify(output) }), { status: 200 });
+  }) as typeof fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const bridge = createBridge() as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+  await bridge.handleRealtimeEvent(JSON.stringify({
+    type: "response.done",
+    response: {
+      output: [
+        { type: "function_call", call_id: "call-say", name: "say_in_game", arguments: "{\"text\":\"I understand\"}" },
+        { type: "function_call", call_id: "call-gather", name: "gather_nearby", arguments: "{}" },
+      ],
+    },
+  }));
+
+  assert.deepEqual(posted.map((body) => body.name), ["gather_nearby", "say_in_game"]);
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 0);
 });
 
 test("browser confirmation answers post to Gateway without creating a raw Realtime turn", async (t) => {
@@ -366,4 +508,95 @@ test("EventSource errors schedule a reconnect instead of immediately closing Rea
   timers[0]!();
   assert.equal(FakeEventSource.instances.length, 2);
   assert.match(FakeEventSource.instances[1]!.url, /local-session/);
+});
+
+test("malformed Realtime function arguments stay in the voice session and receive a recoverable tool error", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const posted: Array<Record<string, unknown>> = [];
+  const sent: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_path, init) => {
+    posted.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+  }) as typeof fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const bridge = createBridge() as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+
+  await bridge.handleRealtimeEvent(JSON.stringify({
+    type: "response.function_call_arguments.done",
+    call_id: "call-bad-json",
+    name: "gather_nearby",
+    arguments: "{\"targetGuid\":",
+  }));
+
+  assert.deepEqual(posted, []);
+  assert.deepEqual(sent.map((event) => event.type), ["conversation.item.create", "response.create"]);
+  const item = sent[0]?.item as { call_id?: string; output?: string } | undefined;
+  assert.equal(item?.call_id, "call-bad-json");
+  assert.deepEqual(JSON.parse(item?.output ?? "{}"), {
+    ok: false,
+    error: {
+      code: "invalid_tool_arguments",
+      message: "Function arguments must be valid JSON.",
+    },
+  });
+});
+
+test("speech stop restores normal assistant audio but keeps it muted while a game action is pending", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const sent: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async (_path, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    if (body.type === "tool-call") {
+      return new Response(JSON.stringify({
+        output: JSON.stringify({
+          accepted: true,
+          commandId: "cmd-gather",
+          kind: "gather_nearby",
+          pending: true,
+          waitRecommended: true,
+        }),
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+  }) as typeof fetch;
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { setTimeout: () => 0 },
+  });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalWindow) {
+      Object.defineProperty(globalThis, "window", originalWindow);
+    } else {
+      Reflect.deleteProperty(globalThis, "window");
+    }
+  });
+
+  const bridge = createBridge() as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+  bridge.audio = { muted: false };
+
+  await bridge.handleRealtimeEvent(JSON.stringify({ type: "input_audio_buffer.speech_started" }));
+  assert.equal(bridge.audio.muted, true);
+
+  await bridge.handleRealtimeEvent(JSON.stringify({ type: "input_audio_buffer.speech_stopped" }));
+  assert.equal(bridge.audio.muted, false);
+
+  await bridge.handleRealtimeEvent(JSON.stringify({
+    type: "response.function_call_arguments.done",
+    call_id: "call-gather",
+    name: "gather_nearby",
+    arguments: "{}",
+  }));
+  assert.equal(bridge.audio.muted, true);
+
+  await bridge.handleRealtimeEvent(JSON.stringify({ type: "input_audio_buffer.speech_started" }));
+  await bridge.handleRealtimeEvent(JSON.stringify({ type: "input_audio_buffer.speech_stopped" }));
+  assert.equal(bridge.audio.muted, true);
+  assert.equal(sent.some((event) => event.type === "response.cancel"), false);
 });

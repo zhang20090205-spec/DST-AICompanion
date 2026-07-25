@@ -1,9 +1,17 @@
 import {
   COMMAND_KINDS,
   COMMAND_PRIORITIES,
+  GATHER_MODES,
+  GATHER_SCOPES,
   type CommandKind,
+  type CommandOutcome,
   type CommandPriority,
+  type CommandResult,
+  type CommandStatus,
   type CompanionState,
+  type GatherMode,
+  type GatherProgress,
+  type GatherScope,
   type NearbyEntity,
 } from "../shared/types.js";
 
@@ -11,7 +19,12 @@ const MAX_CHAT_LENGTH = 120;
 const MAX_NEARBY = 40;
 const MAX_INVENTORY = 40;
 const MAX_DISTANCE = 20;
+const MAX_GATHER_DISTANCE = 21;
+const MAX_GATHER_TARGETS = 40;
+const MAX_GATHER_RESULT_TARGETS = 10_000;
 const MAX_TTL_MS = 30_000;
+const MAX_ALL_GATHER_TTL_MS = 60_000;
+const FRESH_STATE_MS = 5_000;
 const SAFE_TEXT = /[^\u0009\u000A\u000D\u0020-\u007E\u4E00-\u9FFF\u3000-\u303F\uFF00-\uFFEF]/g;
 
 export class ValidationError extends Error {
@@ -42,6 +55,21 @@ function text(value: unknown, maxLength: number): string {
     return "";
   }
   return value.replace(SAFE_TEXT, "").replace(/\s+/g, " ").trim().slice(0, maxLength);
+}
+
+function canonicalPrefab(value: unknown): string {
+  return text(value, 64).toLowerCase();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function requiredCounter(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || value > MAX_GATHER_RESULT_TARGETS) {
+    throw new ValidationError(`Gather outcome ${label} must be an integer between 0 and ${MAX_GATHER_RESULT_TARGETS}.`);
+  }
+  return value;
 }
 
 function normalizePosition(value: unknown): { x: number; z: number } {
@@ -159,11 +187,33 @@ export function isCommandPriority(value: unknown): value is CommandPriority {
   return typeof value === "string" && (COMMAND_PRIORITIES as readonly string[]).includes(value);
 }
 
+export function isCommandStatus(value: unknown): value is CommandStatus {
+  return value === "started"
+    || value === "progress"
+    || value === "succeeded"
+    || value === "partial"
+    || value === "failed"
+    || value === "cancelled";
+}
+
+export function isGatherScope(value: unknown): value is GatherScope {
+  return typeof value === "string" && (GATHER_SCOPES as readonly string[]).includes(value);
+}
+
+export function isGatherMode(value: unknown): value is GatherMode {
+  return typeof value === "string" && (GATHER_MODES as readonly string[]).includes(value);
+}
+
+export function hasFreshState(state: CompanionState | undefined, now = Date.now()): state is CompanionState {
+  return Boolean(state && now - state.receivedAt <= FRESH_STATE_MS);
+}
+
 export function targetFromState(state: CompanionState | undefined, value: unknown, purpose: "gather" | "attack"): NearbyEntity | undefined {
   if (!state || typeof value !== "number" || !Number.isInteger(value)) {
     return undefined;
   }
-  const candidate = state.nearby.find((entity) => entity.guid === value && entity.distance <= MAX_DISTANCE);
+  const maxDistance = purpose === "gather" ? MAX_GATHER_DISTANCE : MAX_DISTANCE;
+  const candidate = state.nearby.find((entity) => entity.guid === value && entity.distance <= maxDistance);
   if (!candidate) {
     return undefined;
   }
@@ -174,6 +224,57 @@ export function targetFromState(state: CompanionState | undefined, value: unknow
     return undefined;
   }
   return candidate;
+}
+
+function supportsGatherMode(entity: NearbyEntity, mode: GatherMode): boolean {
+  if (mode === "chop") {
+    return entity.choppable === true;
+  }
+  if (mode === "mine") {
+    return entity.mineable === true;
+  }
+  return entity.collectable === true;
+}
+
+function canonicalGatherTarget(
+  state: CompanionState,
+  mode: GatherMode,
+  rawTargetGuid: unknown,
+  rawTargetPrefab: unknown,
+): NearbyEntity {
+  let targetGuid: number | undefined;
+  if (rawTargetGuid !== undefined) {
+    if (typeof rawTargetGuid !== "number" || !Number.isSafeInteger(rawTargetGuid) || rawTargetGuid < 1) {
+      throw new ValidationError("Gather targetGuid must be a positive integer.");
+    }
+    targetGuid = rawTargetGuid;
+  }
+
+  let targetPrefab: string | undefined;
+  if (rawTargetPrefab !== undefined) {
+    if (typeof rawTargetPrefab !== "string") {
+      throw new ValidationError("Gather targetPrefab must be a string.");
+    }
+    targetPrefab = canonicalPrefab(rawTargetPrefab);
+    if (!targetPrefab) {
+      throw new ValidationError("Gather targetPrefab is empty after filtering.");
+    }
+  }
+
+  const candidates = state.nearby
+    .filter((entity) => entity.distance <= MAX_GATHER_DISTANCE && supportsGatherMode(entity, mode))
+    .sort((left, right) => left.distance - right.distance || left.guid - right.guid);
+  const target = targetGuid === undefined
+    ? candidates.find((entity) => targetPrefab === undefined || canonicalPrefab(entity.prefab) === targetPrefab)
+    : candidates.find((entity) => entity.guid === targetGuid);
+
+  if (!target) {
+    throw new ValidationError("Gather target is invalid or too far away.");
+  }
+  if (targetPrefab !== undefined && canonicalPrefab(target.prefab) !== targetPrefab) {
+    throw new ValidationError("Gather targetGuid and targetPrefab do not match fresh game state.");
+  }
+  return target;
 }
 
 export function validateCommandArgs(
@@ -188,7 +289,7 @@ export function validateCommandArgs(
   if (kind === "clear_action_queue" || kind === "stop_and_wait" || kind === "follow_player") {
     return {};
   }
-  if (!state || Date.now() - state.receivedAt > 5_000) {
+  if (!hasFreshState(state)) {
     throw new ValidationError("Game state is unavailable or stale.");
   }
   if (kind === "approach_or_retreat") {
@@ -206,12 +307,21 @@ export function validateCommandArgs(
     return { mode, targetGuid };
   }
   if (kind === "gather_nearby") {
-    const mode = args.mode === "chop" || args.mode === "mine" ? args.mode : "collect";
-    const targetGuid = typeof args.targetGuid === "number" ? Math.floor(args.targetGuid) : undefined;
-    if (targetGuid !== undefined && !targetFromState(state, targetGuid, "gather")) {
-      throw new ValidationError("Gather target is invalid or too far away.");
+    if (args.mode !== undefined && !isGatherMode(args.mode)) {
+      throw new ValidationError("Gather mode must be collect, chop, or mine.");
     }
-    return { mode, ...(targetGuid === undefined ? {} : { targetGuid }) };
+    if (args.scope !== undefined && !isGatherScope(args.scope)) {
+      throw new ValidationError("Gather scope must be single or all_same_prefab.");
+    }
+    const mode: GatherMode = isGatherMode(args.mode) ? args.mode : "collect";
+    const scope: GatherScope = isGatherScope(args.scope) ? args.scope : "single";
+    const target = canonicalGatherTarget(state, mode, args.targetGuid, args.targetPrefab);
+    return {
+      mode,
+      scope,
+      targetGuid: target.guid,
+      targetPrefab: canonicalPrefab(target.prefab),
+    };
   }
   if (kind === "attack_nearby_threat") {
     const targetGuid = typeof args.targetGuid === "number" ? Math.floor(args.targetGuid) : undefined;
@@ -245,13 +355,77 @@ export function validateCommandArgs(
   throw new ValidationError("Unsupported command kind.");
 }
 
-export function boundedExpiry(now: number, ttlMs: unknown, kind: CommandKind): number {
-  const defaultTtl = kind === "clear_action_queue" ? 5_000 : 15_000;
+function normalizeGatherProgress(value: unknown): GatherProgress {
+  if (!isRecord(value)) {
+    throw new ValidationError("Gather outcome must be an object.");
+  }
+  if (!isGatherScope(value.scope) || !isGatherMode(value.mode)) {
+    throw new ValidationError("Gather outcome has an invalid scope or mode.");
+  }
+  const targetPrefab = canonicalPrefab(value.targetPrefab);
+  if (!targetPrefab) {
+    throw new ValidationError("Gather outcome targetPrefab is required.");
+  }
+  const attempted = requiredCounter(value.attempted, "attempted");
+  const completed = requiredCounter(value.completed, "completed");
+  const remaining = requiredCounter(value.remaining, "remaining");
+  const skipped = requiredCounter(value.skipped, "skipped");
+  if (completed + remaining + skipped !== attempted) {
+    throw new ValidationError("Gather outcome counters must add up to attempted.");
+  }
+  return { scope: value.scope, mode: value.mode, targetPrefab, attempted, completed, remaining, skipped };
+}
+
+function normalizeCommandOutcome(value: unknown): CommandOutcome | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!isRecord(value) || value.gather === undefined) {
+    throw new ValidationError("Command outcome must contain a gather outcome.");
+  }
+  return { gather: normalizeGatherProgress(value.gather) };
+}
+
+export function validateCommandResult(value: unknown): CommandResult {
+  const source = asRecord(value);
+  if (typeof source.id !== "string" || !/^[A-Za-z0-9_.:-]{1,128}$/.test(source.id)) {
+    throw new ValidationError("Command result id is invalid.");
+  }
+  if (!isCommandStatus(source.status)) {
+    throw new ValidationError("Command result status is invalid.");
+  }
+  if (typeof source.stateRevision !== "number" || !Number.isSafeInteger(source.stateRevision) || source.stateRevision < 0) {
+    throw new ValidationError("Command result stateRevision is invalid.");
+  }
+  if (source.reason !== undefined && typeof source.reason !== "string") {
+    throw new ValidationError("Command result reason must be a string.");
+  }
+  const reason = source.reason === undefined ? undefined : text(source.reason, 160) || undefined;
+  const outcome = normalizeCommandOutcome(source.outcome);
+  return {
+    id: source.id,
+    status: source.status,
+    ...(reason === undefined ? {} : { reason }),
+    stateRevision: source.stateRevision,
+    ...(outcome === undefined ? {} : { outcome }),
+  };
+}
+
+export function boundedExpiry(
+  now: number,
+  ttlMs: unknown,
+  kind: CommandKind,
+  args?: Record<string, unknown>,
+): number {
+  const isAllSamePrefabGather = kind === "gather_nearby" && args?.scope === "all_same_prefab";
+  const defaultTtl = kind === "clear_action_queue" ? 5_000 : isAllSamePrefabGather ? MAX_ALL_GATHER_TTL_MS : 15_000;
+  const maxTtl = isAllSamePrefabGather ? MAX_ALL_GATHER_TTL_MS : MAX_TTL_MS;
   const requested = typeof ttlMs === "number" && Number.isFinite(ttlMs) ? ttlMs : defaultTtl;
-  return now + Math.max(1_000, Math.min(MAX_TTL_MS, requested));
+  return now + Math.max(1_000, Math.min(maxTtl, requested));
 }
 
 export function isLikelyHostile(entity: NearbyEntity): boolean {
-  const labels = [entity.prefab, ...entity.tags].join(" ").toLowerCase();
-  return /monster|hostile|hound|spider|tentacle|frog|merm|hound|bee/.test(labels);
+  const labels = [entity.prefab, ...entity.tags].map((label) => label.toLowerCase());
+  return labels.some((label) => /monster|hostile|hound|spider|tentacle|frog|merm/.test(label))
+    || labels.some((label) => label === "bee" || label.endsWith("bee"));
 }

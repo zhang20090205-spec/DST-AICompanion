@@ -27,6 +27,8 @@ interface GatewayHealthCompanion {
 
 interface GatewayHealth {
   companions?: GatewayHealthCompanion[];
+  model?: string;
+  reasoningEffort?: string;
 }
 
 const STATUS_LABEL: Record<ConnectionStatus, string> = {
@@ -44,6 +46,7 @@ function App() {
   const [game, setGame] = useState<VisibleState>({});
   const [audit, setAudit] = useState<string[]>([]);
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
+  const [realtimeMode, setRealtimeMode] = useState<{ model?: string; reasoningEffort?: string }>({});
   const bridge = useRef<RealtimeBridge | undefined>(undefined);
 
   const indicator = useMemo(() => status === "connected" ? "online" : status === "connecting" ? "pending" : "offline", [status]);
@@ -63,6 +66,10 @@ function App() {
         const companion = health.companions?.find((candidate) => candidate.id === "default");
         if (!disposed) {
           setConfirmation(companion?.confirmation ?? null);
+          setRealtimeMode({
+            model: typeof health.model === "string" ? health.model : undefined,
+            reasoningEffort: typeof health.reasoningEffort === "string" ? health.reasoningEffort : undefined,
+          });
         }
       } catch {
         // A local health refresh must never tear down the active voice session.
@@ -174,6 +181,9 @@ function App() {
     <main className="app-shell">
       <header className="topbar">
         <div className="brand"><AudioLines size={20} /> <span>DST AI Companion</span></div>
+        <div className="realtime-mode" title="低推理等级优先响应速度；可在 .env 中设置 OPENAI_REALTIME_REASONING_EFFORT=high 获得更深推理和更高延迟。">
+          {realtimeMode.model ?? "Realtime"} · 推理 {realtimeMode.reasoningEffort ?? "--"}
+        </div>
         <div className={`status ${indicator}`}><span className="status-dot" />{STATUS_LABEL[status]}</div>
         {status === "connected" ? (
           <button className="icon-button" type="button" title="断开语音" onClick={() => void disconnect()}><MicOff size={18} /></button>

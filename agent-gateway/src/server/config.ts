@@ -29,7 +29,9 @@ function parsePort(value: string | undefined): number {
 }
 
 function parseRealtimeReasoningEffort(value: string | undefined): RealtimeReasoningEffort {
-  const effort = value?.trim() || "medium";
+  // Routine in-game commands should start promptly. Players can explicitly
+  // opt into a slower depth-first session through OPENAI_REALTIME_REASONING_EFFORT.
+  const effort = value?.trim() || "low";
   if (!REALTIME_REASONING_EFFORTS.has(effort as RealtimeReasoningEffort)) {
     throw new Error("OPENAI_REALTIME_REASONING_EFFORT must be minimal, low, medium, high, or xhigh.");
   }

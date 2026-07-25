@@ -11,6 +11,32 @@ $gatewayEntry = Join-Path $gatewayDirectory 'dist\server\server\main.js'
 $gatewayPidPath = Join-Path $gatewayDirectory 'data\gateway.pid'
 $port = 8080
 
+function Stop-ProcessIfRunning {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$ProcessId,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $runningProcess = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $runningProcess) {
+        Write-Host "$Description (PID $ProcessId) already exited."
+        return
+    }
+
+    try {
+        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+    } catch {
+        if ($_.Exception.Message -match '(?i)access is denied') {
+            throw "$Description (PID $ProcessId) was started with Administrator rights. Open an Administrator PowerShell, run `"Stop-Process -Id $ProcessId -Force`", then run this launcher again."
+        }
+        throw
+    }
+    Wait-Process -Id $ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+}
+
 function Enable-UserProxyForNode {
     if (-not [string]::IsNullOrWhiteSpace($env:HTTPS_PROXY) -or -not [string]::IsNullOrWhiteSpace($env:HTTP_PROXY)) {
         if ([string]::IsNullOrWhiteSpace($env:NODE_USE_ENV_PROXY)) {
@@ -57,34 +83,36 @@ Enable-UserProxyForNode
 $legacyProcesses = Get-CimInstance Win32_Process -Filter "Name = 'FAtiMA-Server.exe'"
 foreach ($legacyProcess in $legacyProcesses) {
     Write-Host "Stopping retired FAtiMA server (PID $($legacyProcess.ProcessId))."
-    Stop-Process -Id $legacyProcess.ProcessId -Force
-}
-
-foreach ($legacyProcess in $legacyProcesses) {
-    Wait-Process -Id $legacyProcess.ProcessId -Timeout 10 -ErrorAction SilentlyContinue
+    Stop-ProcessIfRunning -ProcessId $legacyProcess.ProcessId -Description 'Retired FAtiMA server'
 }
 
 $listeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
 $knownGatewayPid = if (Test-Path -LiteralPath $gatewayPidPath) { (Get-Content -LiteralPath $gatewayPidPath -Raw).Trim() } else { '' }
 foreach ($listener in $listeners) {
     $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $($listener.OwningProcess)"
-    $isGateway = $owner -ne $null -and $owner.Name -match '^node(\.exe)?$' -and $owner.CommandLine -match 'dist[\\/]+server[\\/]+server[\\/]+main\.js' -and $knownGatewayPid -eq [string]$listener.OwningProcess
-    if (-not $isGateway -and $owner -ne $null -and $owner.Name -match '^node(\.exe)?$' -and $knownGatewayPid -eq [string]$listener.OwningProcess) {
-        # Some Windows process providers omit CommandLine. Confirm the loopback Gateway
-        # health contract before allowing a recorded Node PID to be restarted.
+    $isNode = $owner -ne $null -and $owner.Name -match '^node(\.exe)?$'
+    $commandMatchesGateway = $isNode -and $owner.CommandLine -match 'dist[\\/]+server[\\/]+server[\\/]+main\.js'
+    $healthMatchesGateway = $false
+    if ($isNode) {
+        # The PID file can be stale after a crash or a manual restart. Confirm the
+        # loopback health contract before accepting the current listener as ours.
         try {
             $health = Invoke-RestMethod -Uri "http://127.0.0.1:$port/api/health" -TimeoutSec 1
-            $isGateway = $health.ok -eq $true -and $health.model -is [string] -and $health.PSObject.Properties.Name -contains 'realtimeConfigured'
+            $healthMatchesGateway = $health.ok -eq $true -and $health.model -is [string] -and $health.PSObject.Properties.Name -contains 'realtimeConfigured'
         } catch {
-            $isGateway = $false
+            $healthMatchesGateway = $false
         }
     }
+    $pidMatchesGateway = $knownGatewayPid -eq [string]$listener.OwningProcess
+    $isGateway = $isNode -and $healthMatchesGateway -and ($commandMatchesGateway -or $pidMatchesGateway)
     if (-not $isGateway) {
         throw "Port $port is occupied by PID $($listener.OwningProcess). The launcher refuses to stop unknown processes."
     }
+    if (-not [string]::IsNullOrWhiteSpace($knownGatewayPid) -and -not $pidMatchesGateway) {
+        Write-Warning "Ignoring stale Gateway PID $knownGatewayPid; port $port is owned by the verified Gateway PID $($listener.OwningProcess)."
+    }
     Write-Host "Restarting existing DST GPT Agent Gateway (PID $($listener.OwningProcess))."
-    Stop-Process -Id $listener.OwningProcess -Force
-    Wait-Process -Id $listener.OwningProcess -Timeout 10 -ErrorAction SilentlyContinue
+    Stop-ProcessIfRunning -ProcessId $listener.OwningProcess -Description 'DST GPT Agent Gateway'
 }
 
 $remainingListeners = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
@@ -126,7 +154,7 @@ try {
 
     if (-not $healthy) {
         if (-not $process.HasExited) {
-            Stop-Process -Id $process.Id -Force
+            Stop-ProcessIfRunning -ProcessId $process.Id -Description 'Unhealthy DST GPT Agent Gateway'
         }
         $errorText = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
         throw "Gateway failed its local health check. $errorText"

@@ -42,8 +42,16 @@ export async function createRealtimeClientSecret(
         type: "realtime",
         model: config.realtimeModel,
         reasoning: { effort: config.realtimeReasoningEffort },
+        // The GA Realtime schema defaults to audio, but making this explicit
+        // prevents a future client/session update from silently falling back
+        // to a text-only response.
+        output_modalities: ["audio"],
         audio: {
           input: {
+            // Realtime models consume the audio directly. This independently
+            // enables the transcription events used by the local transcript
+            // panel and gives the Chinese voice companion an ISO-639-1 hint.
+            transcription: { model: "gpt-4o-mini-transcribe", language: "zh" },
             turn_detection: {
               type: "server_vad",
               create_response: true,

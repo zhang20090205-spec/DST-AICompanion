@@ -11,10 +11,14 @@ export const COMMAND_KINDS = [
 ] as const;
 
 export const COMMAND_PRIORITIES = ["interrupt", "player", "autonomy"] as const;
+export const GATHER_SCOPES = ["single", "all_same_prefab"] as const;
+export const GATHER_MODES = ["collect", "chop", "mine"] as const;
 
 export type CommandKind = (typeof COMMAND_KINDS)[number];
 export type CommandPriority = (typeof COMMAND_PRIORITIES)[number];
-export type CommandStatus = "started" | "succeeded" | "failed" | "cancelled";
+export type GatherScope = (typeof GATHER_SCOPES)[number];
+export type GatherMode = (typeof GATHER_MODES)[number];
+export type CommandStatus = "started" | "progress" | "succeeded" | "partial" | "failed" | "cancelled";
 
 export interface Position {
   x: number;
@@ -70,11 +74,26 @@ export interface Command {
   expiresAt: number;
 }
 
+export interface GatherProgress {
+  scope: GatherScope;
+  mode: GatherMode;
+  targetPrefab: string;
+  attempted: number;
+  completed: number;
+  remaining: number;
+  skipped: number;
+}
+
+export interface CommandOutcome {
+  gather?: GatherProgress;
+}
+
 export interface CommandResult {
   id: string;
   status: CommandStatus;
   reason?: string;
   stateRevision: number;
+  outcome?: CommandOutcome;
 }
 
 export interface PlayerInput {

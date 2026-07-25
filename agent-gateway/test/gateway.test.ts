@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createGatewayApp } from "../src/server/app.js";
-import type { GatewayConfig } from "../src/server/config.js";
+import { loadConfig, type GatewayConfig } from "../src/server/config.js";
 import { GatewayStore } from "../src/server/database.js";
 import { GatewayCore } from "../src/server/gateway.js";
 import { createRealtimeClientSecret } from "../src/server/realtime.js";
@@ -44,6 +44,11 @@ function createCore() {
   return { store, core: new GatewayCore(store) };
 }
 
+test("Gateway defaults to low Realtime reasoning effort while retaining an explicit high override", () => {
+  assert.equal(loadConfig({}).realtimeReasoningEffort, "low");
+  assert.equal(loadConfig({ OPENAI_REALTIME_REASONING_EFFORT: "high" }).realtimeReasoningEffort, "high");
+});
+
 function withFakeNow<T>(initialNow: number, run: (clock: { set: (value: number) => void; advance: (ms: number) => void }) => T): T {
   const originalNow = Date.now;
   let currentNow = initialNow;
@@ -78,7 +83,12 @@ test("accepts only whitelisted, nearby actions and sends a typed command", () =>
   const poll = core.pollCommands("bot-1");
   assert.equal(poll.commands[0]?.id, command.id);
   assert.equal(poll.commands[0]?.kind, "gather_nearby");
-	assert.deepEqual(poll.commands[0]?.args, { mode: "chop", targetGuid: 100 });
+	assert.deepEqual(poll.commands[0]?.args, {
+		mode: "chop",
+		scope: "single",
+		targetGuid: 100,
+		targetPrefab: "evergreen",
+	});
 	const retreat = core.enqueue("bot-1", "approach_or_retreat", { mode: "retreat", targetGuid: 101 }, "player");
 	assert.deepEqual(retreat.args, { mode: "retreat", targetGuid: 101 });
 	assert.throws(() => core.enqueue("bot-1", "gather_nearby", { targetGuid: 999 }, "player"), ValidationError);
@@ -378,6 +388,7 @@ test("health snapshot exposes safe pending confirmation data for reconnect recon
 
   const health = await app.inject({ method: "GET", url: "/api/health" });
   assert.equal(health.statusCode, 200);
+  assert.equal(health.json().reasoningEffort, config.realtimeReasoningEffort);
   const companion = (health.json().companions as Array<{
     id?: string;
     confirmation?: { id?: string; prompt?: string; expiresAt?: number; kind?: string };
@@ -419,6 +430,60 @@ test("HTTP results reject malformed payloads and complete the active command exa
     payload: { id: queued.id, status: "succeeded", stateRevision: 1 },
   });
   assert.deepEqual(duplicate.json(), { accepted: false, duplicate: true });
+  await app.close();
+  store.close();
+});
+
+test("HTTP results validate structured gather progress and terminal outcomes", async () => {
+  const { store, core } = createCore();
+  const app = createGatewayApp(config, core);
+  await app.inject({ method: "POST", url: "/api/dst/v1/companions/bot-1/state", payload: fixtureState() });
+  const command = core.enqueue("bot-1", "gather_nearby", { mode: "chop", targetGuid: 100 }, "player");
+  await app.inject({ method: "GET", url: "/api/dst/v1/companions/bot-1/commands" });
+  const outcome = {
+    gather: {
+      scope: "single",
+      mode: "chop",
+      targetPrefab: "evergreen",
+      attempted: 1,
+      completed: 0,
+      remaining: 1,
+      skipped: 0,
+    },
+  };
+
+  const malformed = await app.inject({
+    method: "POST",
+    url: "/api/dst/v1/companions/bot-1/results",
+    payload: {
+      id: command.id,
+      status: "progress",
+      stateRevision: 2,
+      outcome: { gather: { ...outcome.gather, completed: 2 } },
+    },
+  });
+  assert.equal(malformed.statusCode, 400);
+
+  const progress = await app.inject({
+    method: "POST",
+    url: "/api/dst/v1/companions/bot-1/results",
+    payload: { id: command.id, status: "progress", stateRevision: 2, outcome },
+  });
+  assert.deepEqual(progress.json(), { accepted: true, duplicate: false });
+
+  const invalidSuccess = await app.inject({
+    method: "POST",
+    url: "/api/dst/v1/companions/bot-1/results",
+    payload: { id: command.id, status: "succeeded", stateRevision: 3, outcome },
+  });
+  assert.equal(invalidSuccess.statusCode, 400);
+
+  const partial = await app.inject({
+    method: "POST",
+    url: "/api/dst/v1/companions/bot-1/results",
+    payload: { id: command.id, status: "partial", stateRevision: 4, outcome },
+  });
+  assert.deepEqual(partial.json(), { accepted: true, duplicate: false });
   await app.close();
   store.close();
 });
@@ -537,32 +602,239 @@ test("interrupts mark active and queued commands as cancelled terminal lifecycle
   store.close();
 });
 
-test("Realtime tool calls can wait for Lua terminal command results", async () => {
+test("Realtime action tools return a pending lifecycle immediately", async () => {
   const { store, core } = createCore();
   core.receiveState("bot-1", fixtureState());
 
-  const toolCall = core.handleRealtimeTool("bot-1", "follow_player", {}, "call-follow-wait");
-  await new Promise<void>((resolve) => setTimeout(resolve, 0));
-  const command = core.pollCommands("bot-1").commands[0]!;
-  assert.equal(command.kind, "follow_player");
-  assert.deepEqual(core.receiveResult("bot-1", { id: command.id, status: "started", stateRevision: 1 }), { accepted: true, duplicate: false });
-  assert.deepEqual(core.receiveResult("bot-1", { id: command.id, status: "succeeded", stateRevision: 2 }), { accepted: true, duplicate: false });
-
-  const { output } = await toolCall;
+  const { output } = await core.handleRealtimeTool("bot-1", "follow_player", {}, "call-follow-pending");
   const typedOutput = output as {
     commandId?: string;
     status?: string;
     terminal?: boolean;
     pending?: boolean;
-    lifecycle?: { result?: { status?: string; stateRevision?: number } };
   };
-  assert.equal(typedOutput.commandId, command.id);
-  assert.equal(typedOutput.status, "succeeded");
-  assert.equal(typedOutput.terminal, true);
-  assert.equal(typedOutput.pending, false);
-  assert.equal(typedOutput.lifecycle?.result?.status, "succeeded");
-  assert.equal(typedOutput.lifecycle?.result?.stateRevision, 2);
+  assert.equal(typedOutput.status, "queued");
+  assert.equal(typedOutput.terminal, false);
+  assert.equal(typedOutput.pending, true);
 
+  const command = core.pollCommands("bot-1").commands[0]!;
+  assert.equal(command.kind, "follow_player");
+  assert.equal(typedOutput.commandId, command.id);
+  assert.deepEqual(core.receiveResult("bot-1", { id: command.id, status: "started", stateRevision: 1 }), { accepted: true, duplicate: false });
+  assert.deepEqual(core.receiveResult("bot-1", { id: command.id, status: "succeeded", stateRevision: 2 }), { accepted: true, duplicate: false });
+
+  store.close();
+});
+
+test("gather commands canonicalize fresh single and all-same-prefab targets", () => {
+  withFakeNow(4_000_000, (clock) => {
+    const { store, core } = createCore();
+    core.receiveState("bot-1", {
+      ...fixtureState(),
+      Entities: [
+        { GUID: 401, Prefab: "grass", Distance: 10, Collectable: true },
+        { GUID: 402, Prefab: "grass", Distance: 21, Collectable: true },
+        { GUID: 403, Prefab: "grass", Distance: 22, Collectable: true },
+      ],
+    });
+
+    const command = core.enqueue("bot-1", "gather_nearby", {
+      scope: "all_same_prefab",
+      mode: "collect",
+      targetPrefab: "GRASS",
+    }, "player");
+    assert.deepEqual(command.args, {
+      scope: "all_same_prefab",
+      mode: "collect",
+      targetGuid: 401,
+      targetPrefab: "grass",
+    });
+    assert.equal(command.expiresAt, Date.now() + 60_000);
+    assert.throws(() => core.enqueue("bot-1", "gather_nearby", {
+      scope: "single",
+      mode: "collect",
+      targetGuid: 401,
+      targetPrefab: "twigs",
+    }, "player"), ValidationError);
+
+    clock.advance(5_001);
+    assert.throws(() => core.enqueue("bot-1", "gather_nearby", { mode: "collect", targetGuid: 401 }, "player"), ValidationError);
+    store.close();
+  });
+});
+
+test("gather progress retains the active command, validates outcomes, and emits trusted terminal speech", async () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+  const events: Array<{ type: string; data: Record<string, unknown> }> = [];
+  core.subscribe((event) => events.push(event));
+  const command = core.enqueue("bot-1", "gather_nearby", { mode: "chop", targetGuid: 100 }, "player");
+  assert.equal(core.pollCommands("bot-1").commands[0]?.id, command.id);
+
+  const progress = {
+    gather: {
+      scope: "single",
+      mode: "chop",
+      targetPrefab: "evergreen",
+      attempted: 1,
+      completed: 0,
+      remaining: 1,
+      skipped: 0,
+    },
+  } as const;
+  assert.deepEqual(core.receiveResult("bot-1", {
+    id: command.id,
+    status: "progress",
+    stateRevision: 2,
+    outcome: progress,
+  }), { accepted: true, duplicate: false });
+  assert.equal(core.commandStatus("bot-1", command.id)?.status, "progress");
+  assert.equal(core.commandStatus("bot-1", command.id)?.terminal, false);
+  assert.deepEqual(core.commandStatus("bot-1", command.id)?.progress, progress.gather);
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
+  assert.deepEqual(events.find((event) => event.type === "command-progress")?.data.progress, progress.gather);
+
+  const suppressedSpeech = await core.handleRealtimeTool("bot-1", "say_in_game", { text: "I am done." });
+  assert.equal(suppressedSpeech.output.deferred, true);
+  assert.throws(() => core.receiveResult("bot-1", {
+    id: command.id,
+    status: "succeeded",
+    stateRevision: 3,
+    outcome: progress,
+  }), ValidationError);
+
+  assert.deepEqual(core.receiveResult("bot-1", {
+    id: command.id,
+    status: "partial",
+    stateRevision: 4,
+    outcome: progress,
+  }), { accepted: true, duplicate: false });
+  assert.equal(core.commandStatus("bot-1", command.id)?.status, "partial");
+  assert.equal(core.commandStatus("bot-1", command.id)?.terminal, true);
+  const trustedSpeech = core.pollCommands("bot-1").commands[0]!;
+  assert.equal(trustedSpeech.kind, "say_in_game");
+  assert.deepEqual(trustedSpeech.args, { text: "附近 evergreen：采集 0 个，剩余 1，跳过 0。" });
+  assert.equal(events.some((event) => event.type === "trusted-gather-message" && event.data.deferred === false), true);
+
+  store.close();
+});
+
+test("successful gather results require no remaining targets and report deterministic completion speech", () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+  const command = core.enqueue("bot-1", "gather_nearby", { mode: "chop", targetGuid: 100 }, "player");
+  core.pollCommands("bot-1");
+  const outcome = {
+    gather: {
+      scope: "single",
+      mode: "chop",
+      targetPrefab: "evergreen",
+      attempted: 1,
+      completed: 1,
+      remaining: 0,
+      skipped: 0,
+    },
+  } as const;
+  assert.deepEqual(core.receiveResult("bot-1", {
+    id: command.id,
+    status: "succeeded",
+    stateRevision: 2,
+    outcome,
+  }), { accepted: true, duplicate: false });
+  const trustedSpeech = core.pollCommands("bot-1").commands[0]!;
+  assert.deepEqual(trustedSpeech.args, { text: "附近 evergreen：采集 1 个，剩余 0。" });
+  store.close();
+});
+
+test("skipped gather targets are partial even when no targets remain, and never become a completion report", () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+  const command = core.enqueue("bot-1", "gather_nearby", {
+    scope: "all_same_prefab",
+    mode: "chop",
+    targetGuid: 100,
+  }, "player");
+  core.pollCommands("bot-1");
+  const outcome = {
+    gather: {
+      scope: "all_same_prefab",
+      mode: "chop",
+      targetPrefab: "evergreen",
+      attempted: 2,
+      completed: 1,
+      remaining: 0,
+      skipped: 1,
+    },
+  } as const;
+
+  assert.throws(() => core.receiveResult("bot-1", {
+    id: command.id,
+    status: "succeeded",
+    stateRevision: 2,
+    outcome,
+  }), ValidationError);
+  assert.deepEqual(core.receiveResult("bot-1", {
+    id: command.id,
+    status: "partial",
+    stateRevision: 3,
+    outcome,
+  }), { accepted: true, duplicate: false });
+  const trustedSpeech = core.pollCommands("bot-1").commands[0]!;
+  assert.equal(trustedSpeech.kind, "say_in_game");
+  assert.deepEqual(trustedSpeech.args, { text: "附近 evergreen：采集 1 个，剩余 0，跳过 1。" });
+  assert.doesNotMatch(String(trustedSpeech.args.text), /完成/);
+  store.close();
+});
+
+test("a 40-target gather limit reports the unprocessed overflow as remaining work", () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+  const command = core.enqueue("bot-1", "gather_nearby", {
+    scope: "all_same_prefab",
+    mode: "chop",
+    targetGuid: 100,
+  }, "player");
+  core.pollCommands("bot-1");
+  const outcome = {
+    gather: {
+      scope: "all_same_prefab",
+      mode: "chop",
+      targetPrefab: "evergreen",
+      attempted: 41,
+      completed: 40,
+      remaining: 1,
+      skipped: 0,
+    },
+  } as const;
+  assert.deepEqual(core.receiveResult("bot-1", {
+    id: command.id,
+    status: "partial",
+    stateRevision: 2,
+    outcome,
+  }), { accepted: true, duplicate: false });
+  store.close();
+});
+
+test("only actions that require confirmation can create confirmation requests", () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+  assert.throws(() => core.requestConfirmation("bot-1", "follow_player", {}, "follow?"), ValidationError);
+  assert.throws(() => core.requestConfirmation("bot-1", "approach_or_retreat", { mode: "approach", targetGuid: 9 }, "approach?"), ValidationError);
+  assert.throws(() => core.requestConfirmation("bot-1", "gather_nearby", { mode: "chop", targetGuid: 100 }, "gather?"), ValidationError);
+  const confirmation = core.requestConfirmation("bot-1", "attack_nearby_threat", { targetGuid: 102 }, "attack?");
+  assert.equal(confirmation.command.kind, "attack_nearby_threat");
+  store.close();
+});
+
+test("Realtime intermediate acknowledgements are suppressed before they reach DST chat", async () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+  const preamble = await core.handleRealtimeTool("bot-1", "say_in_game", { text: "I already understand." });
+  assert.equal(preamble.output.deferred, true);
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
+
+  const ordinaryReply = await core.handleRealtimeTool("bot-1", "say_in_game", { text: "我在这里。" });
+  assert.equal(typeof ordinaryReply.command?.id, "string");
   store.close();
 });
 
@@ -628,6 +900,85 @@ test("Realtime tool-call ids dedupe command enqueueing and invalid calls have no
   });
   assert.equal(invalid.statusCode, 400);
   assert.equal(core.pollCommands("bot-2").commands.length, 0);
+  await app.close();
+  store.close();
+});
+
+test("malformed or rejected Realtime tool arguments return a call-scoped output without queueing work", async () => {
+  const { store, core } = createCore();
+  const app = createGatewayApp(config, core);
+  const session = core.registerBrowserSession();
+
+  const malformed = await app.inject({
+    method: "POST",
+    url: "/api/realtime/events",
+    payload: {
+      sessionId: session.sessionId,
+      companionId: "bot-1",
+      type: "tool-call",
+      callId: "call-malformed-json",
+      name: "follow_player",
+      arguments: "{not-json}",
+    },
+  });
+  assert.equal(malformed.statusCode, 200);
+  assert.equal(malformed.json().callId, "call-malformed-json");
+  const malformedOutput = JSON.parse(malformed.json().output) as {
+    ok?: boolean;
+    error?: { code?: string; message?: string };
+  };
+  assert.equal(malformedOutput.ok, false);
+  assert.equal(malformedOutput.error?.code, "tool_validation_error");
+  assert.match(malformedOutput.error?.message ?? "", /not valid JSON/);
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
+
+  const invalidShape = await app.inject({
+    method: "POST",
+    url: "/api/realtime/events",
+    payload: {
+      sessionId: session.sessionId,
+      companionId: "bot-1",
+      type: "tool-call",
+      callId: "call-invalid-shape",
+      name: "follow_player",
+      arguments: [],
+    },
+  });
+  assert.equal(invalidShape.statusCode, 200);
+  assert.equal(invalidShape.json().callId, "call-invalid-shape");
+  const invalidShapeOutput = JSON.parse(invalidShape.json().output) as {
+    ok?: boolean;
+    error?: { code?: string; message?: string };
+  };
+  assert.equal(invalidShapeOutput.ok, false);
+  assert.equal(invalidShapeOutput.error?.code, "tool_validation_error");
+  assert.match(invalidShapeOutput.error?.message ?? "", /JSON object/);
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
+
+  core.receiveState("bot-1", fixtureState());
+  const rejectedByValidator = await app.inject({
+    method: "POST",
+    url: "/api/realtime/events",
+    payload: {
+      sessionId: session.sessionId,
+      companionId: "bot-1",
+      type: "tool-call",
+      callId: "call-invalid-target",
+      name: "gather_nearby",
+      arguments: { mode: "collect", targetGuid: 100 },
+    },
+  });
+  assert.equal(rejectedByValidator.statusCode, 200);
+  assert.equal(rejectedByValidator.json().callId, "call-invalid-target");
+  const rejectedOutput = JSON.parse(rejectedByValidator.json().output) as {
+    ok?: boolean;
+    error?: { code?: string; message?: string };
+  };
+  assert.equal(rejectedOutput.ok, false);
+  assert.equal(rejectedOutput.error?.code, "tool_validation_error");
+  assert.match(rejectedOutput.error?.message ?? "", /Gather target/);
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
+
   await app.close();
   store.close();
 });
@@ -753,15 +1104,28 @@ test("Realtime client-secret proxy uses the server key without returning it", as
       type?: string;
       model?: string;
       reasoning?: { effort?: string };
-      audio?: { input?: { turn_detection?: { type?: string; interrupt_response?: boolean } } };
+      output_modalities?: string[];
+      audio?: {
+        input?: {
+          transcription?: { model?: string; language?: string };
+          turn_detection?: { type?: string; interrupt_response?: boolean };
+        };
+        output?: { voice?: string };
+      };
     };
   };
   assert.deepEqual(requestBody.expires_after, { anchor: "created_at", seconds: 600 });
   assert.equal(requestBody.session?.type, "realtime");
   assert.equal(requestBody.session?.model, config.realtimeModel);
   assert.equal(requestBody.session?.reasoning?.effort, "medium");
+  assert.deepEqual(requestBody.session?.output_modalities, ["audio"]);
+  assert.deepEqual(requestBody.session?.audio?.input?.transcription, {
+    model: "gpt-4o-mini-transcribe",
+    language: "zh",
+  });
   assert.equal(requestBody.session?.audio?.input?.turn_detection?.type, "server_vad");
   assert.equal(requestBody.session?.audio?.input?.turn_detection?.interrupt_response, true);
+  assert.equal(requestBody.session?.audio?.output?.voice, config.realtimeVoice);
 });
 
 test("Realtime session proxy sends a stable hashed safety identifier without leaking raw userid", async (t) => {

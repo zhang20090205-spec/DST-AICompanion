@@ -9,10 +9,15 @@ local COMMAND_POLL_INTERVAL = 0.25
 local NEARBY_RANGE = 21
 local ATTACK_COMMAND_RANGE = 12
 local MAX_NEARBY = 40
+local MAX_GATHER_TARGETS = 40
+local MAX_GATHER_RESULT_TARGETS = 10000
 local MAX_INVENTORY = 40
 local MAX_TEXT_LENGTH = 120
 local MAX_RESULT_REASON = 160
 local AI_SPEECH_MIN_INTERVAL_MS = 500
+local FOLLOW_COMPLETE_RANGE = 3
+local APPROACH_COMPLETE_RANGE = 10
+local RETREAT_COMPLETE_RANGE = 15
 
 local COMMAND_KINDS = {
 	say_in_game = true,
@@ -239,6 +244,26 @@ local function IsVisibleEntity(entity)
 	return IsValidEntity(entity) and (entity.entity == nil or entity.entity:IsVisible())
 end
 
+local function CanonicalPrefab(prefab)
+	return string.lower(SafeText(tostring(prefab or ""), 64))
+end
+
+local function IsGatherableEntity(entity, mode)
+	if not IsVisibleEntity(entity) then
+		return false
+	end
+	if mode == "chop" then
+		return entity:HasTag("CHOP_workable")
+	elseif mode == "mine" then
+		return entity:HasTag("MINE_workable")
+	end
+	return entity:HasTag("pickable")
+		or (entity.components ~= nil
+			and entity.components.inventoryitem ~= nil
+			and entity.components.inventoryitem.canbepickedup
+			and not entity:HasTag("heavy"))
+end
+
 local function IsPlayerEntity(inst, entity)
 	if not IsValidEntity(entity) or entity == inst then
 		return false
@@ -305,6 +330,7 @@ local GPTAgentBrain = Class(LegacyBrain, function(self, inst, server)
 	self.GPTCommandCombatTarget = nil
 	self.GPTGiveItemName = nil
 	self.GPTGiveQuantity = 1
+	self.GPTGatherSession = nil
 	self.GPTMovementTargetGuid = nil
 	self.PlayerInputSequence = 0
 	self.LastAISayAt = 0
@@ -382,6 +408,38 @@ function GPTAgentBrain:ResolveMovementTarget(target_guid)
 	return nil
 end
 
+function GPTAgentBrain:CheckMovementCommandCompletion()
+	local command = self.ActiveCommand
+	if command == nil then
+		return
+	end
+	if command.kind == "follow_player" then
+		local leader = self:GetLeader()
+		if not IsVisibleEntity(leader) then
+			self:CompleteActiveCommand("failed", "follow player is unavailable")
+		elseif math.sqrt(self.inst:GetDistanceSqToInst(leader)) <= FOLLOW_COMPLETE_RANGE then
+			self:CompleteActiveCommand("succeeded")
+		end
+		return
+	end
+	if command.kind ~= "approach_or_retreat" then
+		return
+	end
+	local target = self:GetGPTMovementTarget()
+	if target == nil then
+		self:CompleteActiveCommand("failed", "movement target is unavailable")
+		return
+	end
+	local distance = math.sqrt(self.inst:GetDistanceSqToInst(target))
+	if command.args ~= nil and command.args.mode == "retreat" then
+		if distance >= RETREAT_COMPLETE_RANGE then
+			self:CompleteActiveCommand("succeeded")
+		end
+	elseif distance <= APPROACH_COMPLETE_RANGE then
+		self:CompleteActiveCommand("succeeded")
+	end
+end
+
 function GPTAgentBrain:ShouldKeepBufferedCommandWorking(action, target)
 	if not IsVisibleEntity(target) then
 		return false
@@ -401,6 +459,12 @@ function GPTAgentBrain:FinishBufferedCommand(status, reason)
 		self:DropCommandCombatTarget()
 	end
 	self.CurrentAction = nil
+	if self.ActiveCommand ~= nil
+		and self.ActiveCommand.kind == "gather_nearby"
+		and self.GPTGatherSession ~= nil then
+		self:FinishGatherTarget(status, reason)
+		return
+	end
 	self:CompleteActiveCommand(status, reason)
 end
 
@@ -697,6 +761,7 @@ function GPTAgentBrain:PollCommands()
 		return
 	end
 	self:ExpireActiveCommand()
+	self:CheckMovementCommandCompletion()
 	self.CommandPollInFlight = true
 	TheSim:QueryServer(
 		self:GatewayPath("/commands"),
@@ -779,6 +844,7 @@ function GPTAgentBrain:DispatchCommand(command)
 	self.ActiveActionWFN = nil
 	self.GPTGiveItemName = nil
 	self.GPTGiveQuantity = 1
+	self.GPTGatherSession = nil
 	self:ReportCommandResult(command.id, "started")
 
 	local waits_for_action, apply_reason = self:ApplyCommand(command)
@@ -786,6 +852,8 @@ function GPTAgentBrain:DispatchCommand(command)
 		self:CompleteActiveCommand("failed", apply_reason or "command could not be applied")
 	elseif waits_for_action == false then
 		self:CompleteActiveCommand("succeeded")
+	elseif waits_for_action == "completed" then
+		return
 	end
 end
 
@@ -793,26 +861,29 @@ function GPTAgentBrain:ApplyCommand(command)
 	local args = command.args or {}
 	if command.kind == "clear_action_queue" then
 		self:InterruptLocalAction(SafeText(args.reason or "clear action queue", 80), false)
-		self:SayAI("Standing by.")
 		return false
 	elseif command.kind == "say_in_game" then
 		local text = SafeText(args.text, MAX_TEXT_LENGTH)
 		if text == "" then
 			return nil, "say_in_game text is empty"
 		end
-		self:SayAI(text)
+		if not self:SayAI(text) then
+			return nil, "in-game speech could not be delivered"
+		end
 		return false
 	elseif command.kind == "follow_player" then
-		self:EnsurePlayerTarget(nil)
+		local leader = self:EnsurePlayerTarget(nil)
+		if not IsVisibleEntity(leader) then
+			return nil, "no valid player to follow"
+		end
 		self:InterruptLocalAction("follow player", false)
 		self.UttAction = "Follow"
 		self.Utterance = "follow"
-		return false
+		return true
 	elseif command.kind == "stop_and_wait" then
 		self:InterruptLocalAction("stop and wait", false)
 		self.UttAction = "Stop"
 		self.Utterance = "stop"
-		self:SayAI("Stopping.")
 		return false
 	elseif command.kind == "approach_or_retreat" then
 		local target = self:ResolveMovementTarget(args.targetGuid)
@@ -831,7 +902,7 @@ function GPTAgentBrain:ApplyCommand(command)
 			self.UttAction = "Approach"
 			self.Utterance = "approach"
 		end
-		return false
+		return true
 	elseif command.kind == "gather_nearby" then
 		return self:ApplyGatherCommand(command)
 	elseif command.kind == "attack_nearby_threat" then
@@ -865,43 +936,157 @@ function GPTAgentBrain:EnsurePlayerTarget(target_guid)
 	return self:GetLeader()
 end
 
-function GPTAgentBrain:FindNearbyForCommand(mode, target_guid)
+function GPTAgentBrain:IsGatherTargetInRange(session, entity)
+	return entity ~= self.inst
+		and IsGatherableEntity(entity, session.mode)
+		and CanonicalPrefab(entity.prefab) == session.targetPrefab
+		and math.sqrt(self.inst:GetDistanceSqToInst(entity)) <= NEARBY_RANGE
+end
+
+function GPTAgentBrain:ResolveGatherTarget(mode, target_guid, target_prefab)
+	local canonical_prefab = CanonicalPrefab(target_prefab)
 	if IsFiniteNumber(target_guid) then
 		local target = Ents[math.floor(target_guid)]
-		if IsVisibleEntity(target) and math.sqrt(self.inst:GetDistanceSqToInst(target)) <= NEARBY_RANGE then
+		if target ~= self.inst
+			and IsGatherableEntity(target, mode)
+			and math.sqrt(self.inst:GetDistanceSqToInst(target)) <= NEARBY_RANGE
+			and (canonical_prefab == "" or CanonicalPrefab(target.prefab) == canonical_prefab) then
 			return target
 		end
 		return nil
 	end
+
 	local x, _, z = self.inst.Transform:GetWorldPosition()
 	local ents = TheSim:FindEntities(x, 0, z, NEARBY_RANGE, nil, { "INLIMBO", "NOCLICK", "CLASSIFIED", "FX" }, nil)
 	local best = nil
 	local best_distance = nil
 	for _, entity in ipairs(ents or {}) do
-		if entity ~= self.inst and IsVisibleEntity(entity) then
-			local matches = false
-			if mode == "chop" then
-				matches = entity:HasTag("CHOP_workable")
-			elseif mode == "mine" then
-				matches = entity:HasTag("MINE_workable")
-			else
-				matches = entity:HasTag("pickable")
-					or (entity.components ~= nil and entity.components.inventoryitem ~= nil and entity.components.inventoryitem.canbepickedup and not entity:HasTag("heavy"))
-			end
-			if matches then
-				local distance = self.inst:GetDistanceSqToInst(entity)
-				if best == nil or distance < best_distance then
-					best = entity
-					best_distance = distance
-				end
+		if entity ~= self.inst
+			and IsGatherableEntity(entity, mode)
+			and (canonical_prefab == "" or CanonicalPrefab(entity.prefab) == canonical_prefab) then
+			local distance = self.inst:GetDistanceSqToInst(entity)
+			if best == nil or distance < best_distance then
+				best = entity
+				best_distance = distance
 			end
 		end
 	end
 	return best
 end
 
-function GPTAgentBrain:SetCurrentCommandAction(command, action, target, invobject, recipe)
-	self:InterruptLocalAction("new command action", false)
+function GPTAgentBrain:IsGatherInventoryFull()
+	local inventory = self.inst.components ~= nil and self.inst.components.inventory or nil
+	if inventory == nil then
+		return true
+	end
+	if type(inventory.IsFull) == "function" then
+		return inventory:IsFull()
+	end
+	local occupied = 0
+	for _, item in pairs(inventory.itemslots or {}) do
+		if IsValidEntity(item) then
+			occupied = occupied + 1
+		end
+	end
+	return inventory.maxslots ~= nil and occupied >= inventory.maxslots
+end
+
+function GPTAgentBrain:GatherPendingCount(session)
+	local count = 0
+	for _, _ in pairs(session.pendingGuids or {}) do
+		count = count + 1
+	end
+	return count
+end
+
+function GPTAgentBrain:GatherOverflowCount(session)
+	local count = 0
+	for _, _ in pairs(session.overflowGuids or {}) do
+		count = count + 1
+	end
+	return count
+end
+
+function GPTAgentBrain:RefreshGatherSession(session)
+	-- First turn targets that disappeared, became unworkable, or left the
+	-- command radius into explicit skips. This prevents a false "all done"
+	-- result when another player takes a resource while the companion works.
+	for guid, _ in pairs(session.pendingGuids) do
+		if guid ~= session.currentTargetGuid and not self:IsGatherTargetInRange(session, Ents[guid]) then
+			session.pendingGuids[guid] = nil
+			session.processedGuids[guid] = true
+			session.skipped = session.skipped + 1
+		end
+	end
+	for guid, _ in pairs(session.overflowGuids or {}) do
+		if not self:IsGatherTargetInRange(session, Ents[guid]) then
+			session.overflowGuids[guid] = nil
+			session.skipped = session.skipped + 1
+		end
+	end
+
+	if session.scope == "all_same_prefab" then
+		local x, _, z = self.inst.Transform:GetWorldPosition()
+		local ents = TheSim:FindEntities(x, 0, z, NEARBY_RANGE, nil, { "INLIMBO", "NOCLICK", "CLASSIFIED", "FX" }, nil)
+		for _, entity in ipairs(ents or {}) do
+			local guid = EntityGuid(entity)
+			if guid ~= nil
+				and self:IsGatherTargetInRange(session, entity)
+				and session.pendingGuids[guid] == nil
+				and session.overflowGuids[guid] == nil
+				and session.processedGuids[guid] ~= true then
+				if session.completed + session.skipped + self:GatherPendingCount(session) < MAX_GATHER_TARGETS then
+					session.pendingGuids[guid] = true
+				else
+					session.limitReached = true
+					session.overflowGuids[guid] = true
+				end
+			end
+		end
+	end
+
+	local candidates = {}
+	for guid, _ in pairs(session.pendingGuids) do
+		local entity = Ents[guid]
+		if self:IsGatherTargetInRange(session, entity) then
+			candidates[#candidates + 1] = entity
+		end
+	end
+	table.sort(candidates, function(left, right)
+		local left_distance = self.inst:GetDistanceSqToInst(left)
+		local right_distance = self.inst:GetDistanceSqToInst(right)
+		if left_distance == right_distance then
+			return EntityGuid(left) < EntityGuid(right)
+		end
+		return left_distance < right_distance
+	end)
+
+	session.remaining = #candidates + self:GatherOverflowCount(session)
+	session.attempted = session.completed + session.remaining + session.skipped
+	return candidates
+end
+
+function GPTAgentBrain:BuildGatherOutcome(session)
+	if session == nil then
+		return nil
+	end
+	return {
+		gather = {
+			scope = session.scope,
+			mode = session.mode,
+			targetPrefab = session.targetPrefab,
+			attempted = math.floor(Clamp(session.attempted, 0, MAX_GATHER_RESULT_TARGETS, 0)),
+			completed = math.floor(Clamp(session.completed, 0, MAX_GATHER_RESULT_TARGETS, 0)),
+			remaining = math.floor(Clamp(session.remaining, 0, MAX_GATHER_RESULT_TARGETS, 0)),
+			skipped = math.floor(Clamp(session.skipped, 0, MAX_GATHER_RESULT_TARGETS, 0)),
+		},
+	}
+end
+
+function GPTAgentBrain:SetCurrentCommandAction(command, action, target, invobject, recipe, preserve_runtime)
+	if not preserve_runtime then
+		self:InterruptLocalAction("new command action", false)
+	end
 	local target_guid = EntityGuid(target)
 	local inv_guid = EntityGuid(invobject)
 	local wfn = ActionWfn(command, action)
@@ -920,21 +1105,120 @@ function GPTAgentBrain:SetCurrentCommandAction(command, action, target, invobjec
 	self.ActiveActionWFN = wfn
 end
 
+function GPTAgentBrain:StartNextGatherTarget(target)
+	local session = self.GPTGatherSession
+	if session == nil or self.ActiveCommand == nil or target == nil then
+		return false
+	end
+	local target_guid = EntityGuid(target)
+	if target_guid == nil then
+		return false
+	end
+	session.currentTargetGuid = target_guid
+	local action = WORK_ACTION_BY_GATHER_MODE[session.mode] or "PICKUP"
+	if session.mode == "collect" and target:HasTag("pickable") then
+		action = "PICK"
+	end
+	self:SetCurrentCommandAction(self.ActiveCommand, action, target, nil, nil, true)
+	return true
+end
+
+function GPTAgentBrain:FinishGatherTarget(status, reason)
+	local session = self.GPTGatherSession
+	if session == nil or self.ActiveCommand == nil then
+		return
+	end
+	local target_guid = session.currentTargetGuid
+	session.currentTargetGuid = nil
+	if target_guid == nil then
+		self:CompleteActiveCommand("failed", "gather action lost its target")
+		return
+	end
+	session.pendingGuids[target_guid] = nil
+	session.processedGuids[target_guid] = true
+	if status == "succeeded" then
+		session.completed = session.completed + 1
+	else
+		session.skipped = session.skipped + 1
+	end
+
+	local candidates = self:RefreshGatherSession(session)
+	-- Report every resolved target, including the last one.  The Gateway keeps
+	-- this non-terminal update separate from the one truthful terminal result.
+	local progress_reason = status == "succeeded" and "gather target completed" or SafeText(reason or "gather target skipped", MAX_RESULT_REASON)
+	self:ReportCommandResult(self.ActiveCommand.id, "progress", progress_reason, self:BuildGatherOutcome(session))
+	if #candidates > 0 and self:IsGatherInventoryFull() then
+		self:CompleteActiveCommand("partial", "inventory full")
+		return
+	end
+	if #candidates > 0 then
+		if not self:StartNextGatherTarget(candidates[1]) then
+			self:CompleteActiveCommand("partial", "next gather target is unavailable")
+		end
+		return
+	end
+
+	if session.limitReached then
+		self:CompleteActiveCommand("partial", "gather target limit reached")
+	elseif session.skipped > 0 then
+		self:CompleteActiveCommand("partial", SafeText(reason or "one or more gather targets were unavailable", MAX_RESULT_REASON))
+	elseif session.completed > 0 then
+		-- A gather command is only successful once a rescan has proved that
+		-- no same-prefab, in-range resources remain.
+		self:CompleteActiveCommand("succeeded")
+	else
+		self:CompleteActiveCommand("failed", SafeText(reason or "no gather target completed", MAX_RESULT_REASON))
+	end
+end
+
 function GPTAgentBrain:ApplyGatherCommand(command)
 	local args = command.args or {}
 	local mode = "collect"
 	if args.mode == "chop" or args.mode == "mine" then
 		mode = args.mode
 	end
-	local target = self:FindNearbyForCommand(mode, args.targetGuid)
+	local scope = args.scope == "all_same_prefab" and "all_same_prefab" or "single"
+	local target = self:ResolveGatherTarget(mode, args.targetGuid, args.targetPrefab)
 	if target == nil then
 		return nil, "no valid nearby gather target"
 	end
-	local action = WORK_ACTION_BY_GATHER_MODE[mode] or "PICKUP"
-	if mode == "collect" and target:HasTag("pickable") then
-		action = "PICK"
+	local target_prefab = CanonicalPrefab(args.targetPrefab)
+	if target_prefab == "" then
+		target_prefab = CanonicalPrefab(target.prefab)
 	end
-	self:SetCurrentCommandAction(command, action, target, nil, nil)
+	self:InterruptLocalAction("start gather", false, true)
+	self.GPTGatherSession = {
+		scope = scope,
+		mode = mode,
+		targetPrefab = target_prefab,
+		pendingGuids = {},
+		overflowGuids = {},
+		processedGuids = {},
+		currentTargetGuid = nil,
+		attempted = 0,
+		completed = 0,
+		remaining = 0,
+		skipped = 0,
+		limitReached = false,
+	}
+	local session = self.GPTGatherSession
+	local target_guid = EntityGuid(target)
+	if target_guid ~= nil then
+		session.pendingGuids[target_guid] = true
+	end
+	local candidates = self:RefreshGatherSession(session)
+	if #candidates < 1 then
+		self:CompleteActiveCommand("failed", "no valid nearby gather target")
+		return "completed"
+	end
+	if self:IsGatherInventoryFull() then
+		self:CompleteActiveCommand("partial", "inventory full")
+		return "completed"
+	end
+	if not self:StartNextGatherTarget(candidates[1]) then
+		self:CompleteActiveCommand("failed", "gather action could not start")
+		return "completed"
+	end
 	return true
 end
 
@@ -1091,6 +1375,11 @@ end
 
 function GPTAgentBrain:OnActionEndEvent(name, value)
 	if self.ActiveCommand ~= nil and self.ActiveActionWFN ~= nil and name == self.ActiveActionWFN then
+		if self.ActiveCommand.kind == "gather_nearby" then
+			-- Gather completion is measured by the BufferedAction callbacks after
+			-- a rescan, not by the legacy action event alone.
+			return
+		end
 		self:CompleteActiveCommand("succeeded")
 	end
 end
@@ -1123,7 +1412,7 @@ function GPTAgentBrain:DropCommandCombatTarget()
 	self.GPTCommandCombatTarget = nil
 end
 
-function GPTAgentBrain:InterruptLocalAction(reason, report_active)
+function GPTAgentBrain:InterruptLocalAction(reason, report_active, preserve_gather_session)
 	if report_active and self.ActiveCommand ~= nil then
 		self:CompleteActiveCommand("cancelled", SafeText(reason, MAX_RESULT_REASON))
 	end
@@ -1134,6 +1423,9 @@ function GPTAgentBrain:InterruptLocalAction(reason, report_active)
 	self.UttAction = nil
 	self.GPTGiveItemName = nil
 	self.GPTGiveQuantity = 1
+	if not preserve_gather_session then
+		self.GPTGatherSession = nil
+	end
 	self.GPTMovementTargetGuid = nil
 	self.ActiveActionWFN = nil
 	if self.inst.ClearBufferedAction ~= nil then
@@ -1149,11 +1441,16 @@ end
 
 function GPTAgentBrain:ExpireActiveCommand()
 	if self.ActiveCommand ~= nil and IsFiniteNumber(self.ActiveCommand.expiresAt) and self.ActiveCommand.expiresAt <= NowMs() then
-		self:InterruptLocalAction("command expired", true)
+		if self.ActiveCommand.kind == "gather_nearby" and self.GPTGatherSession ~= nil then
+			self:CompleteActiveCommand("partial", "command expired")
+			self:InterruptLocalAction("command expired", false)
+		else
+			self:InterruptLocalAction("command expired", true)
+		end
 	end
 end
 
-function GPTAgentBrain:ReportCommandResult(command_id, status, reason)
+function GPTAgentBrain:ReportCommandResult(command_id, status, reason, outcome)
 	local body = {
 		id = command_id,
 		status = status,
@@ -1161,6 +1458,9 @@ function GPTAgentBrain:ReportCommandResult(command_id, status, reason)
 	}
 	if type(reason) == "string" and reason ~= "" then
 		body.reason = SafeText(reason, MAX_RESULT_REASON)
+	end
+	if type(outcome) == "table" then
+		body.outcome = outcome
 	end
 	TheSim:QueryServer(
 		self:GatewayPath("/results"),
@@ -1174,12 +1474,17 @@ function GPTAgentBrain:CompleteActiveCommand(status, reason)
 		return
 	end
 	local command_id = self.ActiveCommand.id
-	self:ReportCommandResult(command_id, status, reason)
-	if status ~= "started" then
+	local gather_outcome = nil
+	if self.ActiveCommand.kind == "gather_nearby" and self.GPTGatherSession ~= nil and status ~= "started" then
+		gather_outcome = self:BuildGatherOutcome(self.GPTGatherSession)
+	end
+	self:ReportCommandResult(command_id, status, reason, gather_outcome)
+	if status ~= "started" and status ~= "progress" then
 		self.ActiveCommand = nil
 		self.ActiveActionWFN = nil
 		self.GPTGiveItemName = nil
 		self.GPTGiveQuantity = 1
+		self.GPTGatherSession = nil
 	end
 end
 
@@ -1252,19 +1557,29 @@ end
 function GPTAgentBrain:SayAI(text)
 	text = SafeText(text, MAX_TEXT_LENGTH)
 	if text == "" then
-		return
+		return false
 	end
 	local now = NowMs()
 	if self.LastAISayAt ~= nil and now - self.LastAISayAt < AI_SPEECH_MIN_INTERVAL_MS then
-		return
+		return false
 	end
-	self.LastAISayAt = now
+	local delivered = false
 	if self.inst.components ~= nil and self.inst.components.talker ~= nil then
-		self.inst.components.talker:Say(text)
+		local ok = pcall(function()
+			self.inst.components.talker:Say(text)
+		end)
+		delivered = delivered or ok
 	end
 	if TheNet ~= nil and TheNet.SystemMessage ~= nil then
-		TheNet:SystemMessage("[AI] " .. text)
+		local ok = pcall(function()
+			TheNet:SystemMessage("[AI] " .. text)
+		end)
+		delivered = delivered or ok
 	end
+	if delivered then
+		self.LastAISayAt = now
+	end
+	return delivered
 end
 
 return GPTAgentBrain

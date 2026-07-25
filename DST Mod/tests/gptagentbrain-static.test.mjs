@@ -189,32 +189,54 @@ test("Lua revalidates rare gives and honors entity movement targets", async () =
 	assert.match(gpt, /"GPTRetreat"/);
 });
 
-test("gather commands report started before execution and wait for buffered completion", async () => {
+test("gather commands report started, emit progress, and only finish after the local scan is exhausted", async () => {
 	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
 
 	assert.match(
 		gpt,
-		/self:ReportCommandResult\(command\.id, "started"\)\s+local waits_for_action, apply_reason = self:ApplyCommand\(command\)\s+if waits_for_action == nil then\s+self:CompleteActiveCommand\("failed", apply_reason or "command could not be applied"\)\s+elseif waits_for_action == false then\s+self:CompleteActiveCommand\("succeeded"\)\s+end/m,
+		/self:ReportCommandResult\(command\.id, "started"\)\s+local waits_for_action, apply_reason = self:ApplyCommand\(command\)\s+if waits_for_action == nil then\s+self:CompleteActiveCommand\("failed", apply_reason or "command could not be applied"\)\s+elseif waits_for_action == false then\s+self:CompleteActiveCommand\("succeeded"\)\s+elseif waits_for_action == "completed" then\s+return\s+end/m,
 	);
-	assert.match(
-		gpt,
-		/function GPTAgentBrain:ApplyGatherCommand\(command\)[\s\S]*?self:SetCurrentCommandAction\(command, action, target, nil, nil\)\s+return true\s+end/,
-	);
+	assert.match(gpt, /local MAX_GATHER_TARGETS = 40/);
+	assert.match(gpt, /local MAX_GATHER_RESULT_TARGETS = 10000/);
+	assert.match(gpt, /function GPTAgentBrain:RefreshGatherSession\(session\)/);
+	assert.match(gpt, /session\.scope == "all_same_prefab"/);
+	assert.match(gpt, /CanonicalPrefab\(entity\.prefab\) == session\.targetPrefab/);
+	assert.match(gpt, /session\.overflowGuids\[guid\] = true/);
+	assert.match(gpt, /session\.remaining = #candidates \+ self:GatherOverflowCount\(session\)/);
+	assert.match(gpt, /function GPTAgentBrain:StartNextGatherTarget\(target\)/);
+	assert.match(gpt, /self:ReportCommandResult\(self\.ActiveCommand\.id, "progress", progress_reason, self:BuildGatherOutcome\(session\)\)/);
+	assert.match(gpt, /if session\.limitReached then\s+self:CompleteActiveCommand\("partial", "gather target limit reached"\)/m);
+	assert.match(gpt, /elseif session\.skipped > 0 then\s+self:CompleteActiveCommand\("partial"/m);
+	assert.match(gpt, /elseif session\.completed > 0 then[\s\S]*?self:CompleteActiveCommand\("succeeded"\)/);
+	assert.match(gpt, /self:CompleteActiveCommand\("partial", "inventory full"\)/);
 	assert.match(gpt, /buffered:AddSuccessAction\(function\(\)[\s\S]*?self:FinishBufferedCommand\("succeeded"\)\s+end\)/);
 	assert.match(gpt, /buffered:AddFailAction\(function\(\)[\s\S]*?self:FinishBufferedCommand\("failed", "buffered action failed"\)\s+end\)/);
 });
 
-test("active command cancellation is reported for replacement expiry and local interrupts", async () => {
+test("active command cancellation and expiry produce honest terminal states", async () => {
 	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
 
 	assert.match(gpt, /self:CompleteActiveCommand\("cancelled", "replaced by newer command"\)/);
 	assert.match(
 		gpt,
-		/function GPTAgentBrain:InterruptLocalAction\(reason, report_active\)\s+if report_active and self\.ActiveCommand ~= nil then\s+self:CompleteActiveCommand\("cancelled", SafeText\(reason, MAX_RESULT_REASON\)\)\s+end/,
+		/function GPTAgentBrain:InterruptLocalAction\(reason, report_active, preserve_gather_session\)\s+if report_active and self\.ActiveCommand ~= nil then\s+self:CompleteActiveCommand\("cancelled", SafeText\(reason, MAX_RESULT_REASON\)\)\s+end/,
 	);
 	assert.match(
 		gpt,
-		/function GPTAgentBrain:ExpireActiveCommand\(\)\s+if self\.ActiveCommand ~= nil and IsFiniteNumber\(self\.ActiveCommand\.expiresAt\) and self\.ActiveCommand\.expiresAt <= NowMs\(\) then\s+self:InterruptLocalAction\("command expired", true\)\s+end\s+end/,
+		/function GPTAgentBrain:ExpireActiveCommand\(\)\s+if self\.ActiveCommand ~= nil and IsFiniteNumber\(self\.ActiveCommand\.expiresAt\) and self\.ActiveCommand\.expiresAt <= NowMs\(\) then\s+if self\.ActiveCommand\.kind == "gather_nearby" and self\.GPTGatherSession ~= nil then\s+self:CompleteActiveCommand\("partial", "command expired"\)\s+self:InterruptLocalAction\("command expired", false\)\s+else\s+self:InterruptLocalAction\("command expired", true\)\s+end\s+end\s+end/m,
 	);
 	assert.match(gpt, /self:CompleteActiveCommand\("cancelled", "action cleared"\)/);
+});
+
+test("movement and in-game speech do not claim success until their observable effects exist", async () => {
+	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
+
+	assert.match(gpt, /function GPTAgentBrain:CheckMovementCommandCompletion\(\)/);
+	assert.match(gpt, /math\.sqrt\(self\.inst:GetDistanceSqToInst\(leader\)\) <= FOLLOW_COMPLETE_RANGE/);
+	assert.match(gpt, /distance >= RETREAT_COMPLETE_RANGE/);
+	assert.match(gpt, /distance <= APPROACH_COMPLETE_RANGE/);
+	assert.match(gpt, /if not self:SayAI\(text\) then\s+return nil, "in-game speech could not be delivered"\s+end/m);
+	assert.match(gpt, /function GPTAgentBrain:SayAI\(text\)[\s\S]*?return false[\s\S]*?local delivered = false[\s\S]*?return delivered/);
+	assert.match(gpt, /self\.inst\.components\.talker:Say\(text\)/);
+	assert.match(gpt, /TheNet:SystemMessage\("\[AI\] " \.\. text\)/);
 });

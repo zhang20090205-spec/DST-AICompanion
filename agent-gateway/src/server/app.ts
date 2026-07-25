@@ -2,11 +2,11 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import Fastify, { type FastifyInstance } from "fastify";
 import fastifyStatic from "@fastify/static";
-import type { CommandResult, PlayerInput } from "../shared/types.js";
+import type { PlayerInput } from "../shared/types.js";
 import type { GatewayConfig } from "./config.js";
 import { GatewayCore } from "./gateway.js";
 import { createRealtimeClientSecret } from "./realtime.js";
-import { ValidationError } from "./validation.js";
+import { ValidationError, validateCommandResult } from "./validation.js";
 
 interface CompanionParams {
   id: string;
@@ -44,15 +44,32 @@ function asRecord(value: unknown): Record<string, unknown> {
 }
 
 function parseToolArguments(value: unknown): Record<string, unknown> {
+  let parsed = value;
   if (typeof value === "string") {
     try {
-      const parsed = JSON.parse(value);
-      return asRecord(parsed);
+      parsed = JSON.parse(value);
     } catch {
       throw new ValidationError("Realtime tool arguments were not valid JSON.");
     }
   }
-  return asRecord(value);
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new ValidationError("Realtime tool arguments must be a JSON object.");
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function rejectedRealtimeToolOutput(callId: string, error: ValidationError): { callId: string; output: string } {
+  const message = error.message.replace(/\s+/g, " ").trim().slice(0, 240) || "The tool call was rejected.";
+  return {
+    callId,
+    // The browser turns this response into a function_call_output with the
+    // original call_id, allowing the model to correct its arguments without
+    // tearing down the WebRTC session.
+    output: JSON.stringify({
+      ok: false,
+      error: { code: "tool_validation_error", message },
+    }),
+  };
 }
 
 export function createGatewayApp(config: GatewayConfig, core: GatewayCore): FastifyInstance {
@@ -75,6 +92,7 @@ export function createGatewayApp(config: GatewayConfig, core: GatewayCore): Fast
     ok: true,
     realtimeConfigured: Boolean(config.apiKey),
     model: config.realtimeModel,
+    reasoningEffort: config.realtimeReasoningEffort,
     ...core.status(),
   }));
 
@@ -87,17 +105,8 @@ export function createGatewayApp(config: GatewayConfig, core: GatewayCore): Fast
     return { ok: true, stateRevision: state.revision, epoch: core.getEpoch(request.params.id) };
   });
 
-  app.post<{ Params: CompanionParams; Body: CommandResult }>("/api/dst/v1/companions/:id/results", async (request) => {
-    const body = asRecord(request.body);
-    if (typeof body.id !== "string" || !["started", "succeeded", "failed", "cancelled"].includes(String(body.status)) || typeof body.stateRevision !== "number") {
-      throw new ValidationError("Invalid companion action result.");
-    }
-    return core.receiveResult(request.params.id, {
-      id: body.id,
-      status: body.status as CommandResult["status"],
-      reason: typeof body.reason === "string" ? body.reason.slice(0, 160) : undefined,
-      stateRevision: body.stateRevision,
-    });
+  app.post<{ Params: CompanionParams; Body: unknown }>("/api/dst/v1/companions/:id/results", async (request) => {
+    return core.receiveResult(request.params.id, validateCommandResult(request.body));
   });
 
   app.post<{ Params: CompanionParams; Body: PlayerInput }>("/api/dst/v1/companions/:id/player-input", async (request) => {
@@ -129,8 +138,15 @@ export function createGatewayApp(config: GatewayConfig, core: GatewayCore): Fast
       if (typeof body.callId !== "string" || body.callId.length > 128) {
         throw new ValidationError("Realtime function call is missing callId.");
       }
-      const result = await core.handleRealtimeTool(companionId, body.name, parseToolArguments(body.arguments), body.callId);
-      return { callId: body.callId, output: JSON.stringify(result.output) };
+      try {
+        const result = await core.handleRealtimeTool(companionId, body.name, parseToolArguments(body.arguments), body.callId);
+        return { callId: body.callId, output: JSON.stringify(result.output) };
+      } catch (error) {
+        if (error instanceof ValidationError) {
+          return rejectedRealtimeToolOutput(body.callId, error);
+        }
+        throw error;
+      }
     }
     if (body.type === "transcript") {
       if (typeof body.text !== "string") {
