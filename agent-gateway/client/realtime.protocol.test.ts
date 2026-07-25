@@ -4,6 +4,7 @@ import {
   REALTIME_CALLS_URL,
   REALTIME_TOOLS,
   RealtimeBridge,
+  SYSTEM_INSTRUCTIONS,
   buildGatewayRealtimeNotice,
   buildFunctionCallOutput,
   buildSessionUpdate,
@@ -37,6 +38,12 @@ test("the browser session update exposes only the approved tool surface", () => 
     model: "gpt-4o-mini-transcribe",
     language: "zh",
   });
+  assert.deepEqual(update.session.audio.input.turn_detection, {
+    type: "semantic_vad",
+    eagerness: "high",
+    create_response: true,
+    interrupt_response: true,
+  });
   assert.equal(update.session.audio.input.turn_detection.interrupt_response, true);
   assert.deepEqual(REALTIME_TOOLS.map((tool) => tool.name), [
     "get_game_state", "search_dst_knowledge", "say_in_game", "follow_player", "stop_and_wait",
@@ -52,10 +59,24 @@ test("browser WebRTC SDP is posted only to the Realtime calls endpoint", () => {
 test("WebRTC VAD delegates response interruption and truncation to the server", () => {
 	const update = buildSessionUpdate();
 	assert.deepEqual(update.session.audio.input.turn_detection, {
-		type: "server_vad",
+		type: "semantic_vad",
+    eagerness: "high",
 		create_response: true,
 		interrupt_response: true,
 	});
+});
+
+test("instructions require a single same-turn browser-audio preamble before low-risk tools", () => {
+  assert.match(SYSTEM_INSTRUCTIONS, /一句很短、自然、不宣称完成的前言/);
+  assert.match(SYSTEM_INSTRUCTIONS, /前言必须在该动作工具调用之前的同一 Realtime 回复中出现/);
+  assert.match(SYSTEM_INSTRUCTIONS, /不宣称完成/);
+  assert.match(SYSTEM_INSTRUCTIONS, /玩家、VAD 或 stop 导致的取消保持安静/);
+  const follow = REALTIME_TOOLS.find((tool) => tool.name === "follow_player");
+  const gather = REALTIME_TOOLS.find((tool) => tool.name === "gather_nearby");
+  const say = REALTIME_TOOLS.find((tool) => tool.name === "say_in_game");
+  assert.match(follow?.description ?? "", /immediately before calling this tool/);
+  assert.match(gather?.description ?? "", /never claim completion before command-result/);
+  assert.match(say?.description ?? "", /Do not use this for low-risk action preambles/);
 });
 
 test("VAD events distinguish player speaking from an idle connected voice session", () => {
@@ -186,7 +207,7 @@ test("Realtime tool calls reach the Gateway but raw assistant audio transcripts 
   assert.deepEqual(sent[1], { type: "response.create" });
 });
 
-test("pending gameplay tools suppress assistant output until one trusted terminal result", async (t) => {
+test("pending gameplay tools do not create a second response after their same-turn preamble", async (t) => {
   const originalFetch = globalThis.fetch;
   const originalEventSource = Object.getOwnPropertyDescriptor(globalThis, "EventSource");
   const sent: Array<Record<string, unknown>> = [];
@@ -223,6 +244,7 @@ test("pending gameplay tools suppress assistant output until one trusted termina
       terminal: false,
       pending: true,
       waitRecommended: true,
+      feedback: { policy: "issues_only", channel: "voice_only_preamble" },
     }),
   }), { status: 200 })) as typeof fetch;
   Object.defineProperty(globalThis, "EventSource", { configurable: true, value: FakeEventSource });
@@ -254,7 +276,7 @@ test("pending gameplay tools suppress assistant output until one trusted termina
 
   assert.equal(sent.filter((event) => event.type === "response.create").length, 0);
   assert.equal(sent.filter((event) => event.type === "response.cancel").length, 0);
-  assert.deepEqual(transcripts, []);
+  assert.deepEqual(transcripts, [{ role: "assistant", text: "I will gather them now." }]);
 
   FakeEventSource.instance!.emit("command-result", {
     type: "command-result",
@@ -285,11 +307,113 @@ test("pending gameplay tools suppress assistant output until one trusted termina
     data: { kind: "gather_nearby", result: { id: "cmd-gather", status: "succeeded", stateRevision: 4 } },
   });
 
-  assert.equal(sent.filter((event) => event.type === "response.create").length, 1);
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 0);
   assert.equal(sent.filter((event) => event.type === "conversation.item.create").length, 2);
 });
 
-test("same-turn gameplay tools are posted before a say_in_game preamble", async (t) => {
+test("stop and clear actions never request a voice preamble", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const sent: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    output: JSON.stringify({
+      accepted: true,
+      commandId: "cmd-stop",
+      kind: "stop_and_wait",
+      status: "queued",
+      terminal: false,
+      pending: true,
+      waitRecommended: true,
+      feedback: { policy: "silent_success", channel: "voice_only_preamble" },
+    }),
+  }), { status: 200 })) as typeof fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const bridge = createBridge() as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+
+  await bridge.handleRealtimeEvent(JSON.stringify({
+    type: "response.function_call_arguments.done",
+    call_id: "call-stop",
+    name: "stop_and_wait",
+    arguments: "{}",
+  }));
+
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 0);
+  const item = sent[0]?.item as { call_id?: string; output?: string } | undefined;
+  assert.equal(item?.call_id, "call-stop");
+  assert.equal(JSON.parse(item?.output ?? "{}").commandId, "cmd-stop");
+});
+
+test("always_result terminal responses create one result reply after a direct pending action", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalEventSource = Object.getOwnPropertyDescriptor(globalThis, "EventSource");
+  const sent: Array<Record<string, unknown>> = [];
+
+  class FakeEventSource {
+    static instance?: FakeEventSource;
+    onerror?: () => void;
+    readonly listeners = new Map<string, Array<(message: MessageEvent<string>) => void>>();
+
+    constructor(_url: string) {
+      FakeEventSource.instance = this;
+    }
+
+    addEventListener(type: string, listener: (message: MessageEvent<string>) => void): void {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+    }
+
+    close(): void {}
+
+    emit(type: string, event: unknown): void {
+      for (const listener of this.listeners.get(type) ?? []) {
+        listener({ data: JSON.stringify(event) } as MessageEvent<string>);
+      }
+    }
+  }
+
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    output: JSON.stringify({
+      accepted: true,
+      commandId: "cmd-always",
+      kind: "gather_nearby",
+      pending: true,
+      waitRecommended: true,
+      feedback: { policy: "always_result", channel: "voice_only_preamble" },
+    }),
+  }), { status: 200 })) as typeof fetch;
+  Object.defineProperty(globalThis, "EventSource", { configurable: true, value: FakeEventSource });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalEventSource) {
+      Object.defineProperty(globalThis, "EventSource", originalEventSource);
+    } else {
+      Reflect.deleteProperty(globalThis, "EventSource");
+    }
+  });
+
+  const bridge = createBridge() as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+  bridge.connectEventStream();
+
+  await bridge.handleRealtimeEvent(JSON.stringify({
+    type: "response.function_call_arguments.done",
+    call_id: "call-always",
+    name: "gather_nearby",
+    arguments: "{}",
+  }));
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 0);
+
+  FakeEventSource.instance!.emit("command-result", {
+    type: "command-result",
+    companionId: "bot-1",
+    data: { kind: "gather_nearby", result: { id: "cmd-always", status: "succeeded", stateRevision: 6 } },
+  });
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 1);
+});
+
+test("same-turn say_in_game preambles are kept voice-only while a game action is pending", async (t) => {
   const originalFetch = globalThis.fetch;
   const posted: Array<Record<string, unknown>> = [];
   const sent: Array<Record<string, unknown>> = [];
@@ -297,7 +421,14 @@ test("same-turn gameplay tools are posted before a say_in_game preamble", async 
     const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
     posted.push(body);
     const output = body.name === "gather_nearby"
-      ? { accepted: true, commandId: "cmd-gather", kind: "gather_nearby", pending: true, waitRecommended: true }
+      ? {
+          accepted: true,
+          commandId: "cmd-gather",
+          kind: "gather_nearby",
+          pending: true,
+          waitRecommended: true,
+          feedback: { policy: "issues_only", channel: "voice_only_preamble" },
+        }
       : { accepted: false, deferred: true };
     return new Response(JSON.stringify({ output: JSON.stringify(output) }), { status: 200 });
   }) as typeof fetch;
@@ -316,8 +447,13 @@ test("same-turn gameplay tools are posted before a say_in_game preamble", async 
     },
   }));
 
-  assert.deepEqual(posted.map((body) => body.name), ["gather_nearby", "say_in_game"]);
+  assert.deepEqual(posted.map((body) => body.name), ["gather_nearby"]);
   assert.equal(sent.filter((event) => event.type === "response.create").length, 0);
+  const sayOutput = sent.find((event) => {
+    const item = event.item as { call_id?: string } | undefined;
+    return item?.call_id === "call-say";
+  })?.item as { output?: string } | undefined;
+  assert.equal(JSON.parse(sayOutput?.output ?? "{}").error.code, "voice_only_preamble_required");
 });
 
 test("browser confirmation answers post to Gateway without creating a raw Realtime turn", async (t) => {
@@ -397,7 +533,7 @@ test("manual browser text still posts to Gateway and creates a Realtime reply tu
   ]);
 });
 
-test("trusted terminal command results are injected back into Realtime", () => {
+test("trusted terminal command results are injected and follow feedback response policy", () => {
   const notice = buildGatewayRealtimeNotice({
     type: "command-result",
     companionId: "bot-1",
@@ -406,7 +542,7 @@ test("trusted terminal command results are injected back into Realtime", () => {
       result: { id: "cmd-1", status: "succeeded", stateRevision: 12 },
     },
   });
-  assert.equal(notice?.createResponse, true);
+  assert.equal(notice?.createResponse, false);
   assert.equal(notice?.message.type, "conversation.item.create");
   const item = notice?.message.item as { content?: Array<{ text?: string }> } | undefined;
   const text = item?.content?.[0]?.text ?? "";
@@ -416,11 +552,30 @@ test("trusted terminal command results are injected back into Realtime", () => {
 
   assert.equal(buildGatewayRealtimeNotice({
     type: "command-result",
-    data: { kind: "say_in_game", result: { id: "say-1", status: "succeeded", stateRevision: 13 } },
+    data: {
+      kind: "gather_nearby",
+      feedback: { policy: "always_result" },
+      result: { id: "cmd-2", status: "succeeded", stateRevision: 13 },
+    },
+  })?.createResponse, true);
+
+  assert.equal(buildGatewayRealtimeNotice({
+    type: "command-result",
+    data: { kind: "gather_nearby", result: { id: "cmd-3", status: "partial", stateRevision: 14 } },
+  })?.createResponse, true);
+
+  assert.equal(buildGatewayRealtimeNotice({
+    type: "command-result",
+    data: { kind: "gather_nearby", result: { id: "cmd-4", status: "cancelled", reason: "voice_vad", stateRevision: 15 } },
+  })?.createResponse, false);
+
+  assert.equal(buildGatewayRealtimeNotice({
+    type: "command-result",
+    data: { kind: "say_in_game", result: { id: "say-1", status: "succeeded", stateRevision: 16 } },
   }), undefined);
 });
 
-test("accepted confirmations update Realtime context without prompting a premature reply", () => {
+test("accepted confirmations update Realtime context and allow one voice preamble", () => {
   const notice = buildGatewayRealtimeNotice({
     type: "confirmation",
     companionId: "bot-1",
@@ -430,10 +585,88 @@ test("accepted confirmations update Realtime context without prompting a prematu
       command: { id: "cmd-2", kind: "gather_nearby" },
     },
   });
-  assert.equal(notice?.createResponse, false);
+  assert.equal(notice?.createResponse, true);
   const item = notice?.message.item as { content?: Array<{ text?: string }> } | undefined;
   assert.match(item?.content?.[0]?.text ?? "", /不能说已经完成/);
   assert.match(item?.content?.[0]?.text ?? "", /不要再次调用同一个动作工具/);
+  assert.match(item?.content?.[0]?.text ?? "", /语音等待前言/);
+});
+
+test("accepted confirmations create only one preamble response and block duplicate action tools", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalEventSource = Object.getOwnPropertyDescriptor(globalThis, "EventSource");
+  const posted: Array<Record<string, unknown>> = [];
+  const sent: Array<Record<string, unknown>> = [];
+
+  class FakeEventSource {
+    static instance?: FakeEventSource;
+    onerror?: () => void;
+    readonly listeners = new Map<string, Array<(message: MessageEvent<string>) => void>>();
+
+    constructor(_url: string) {
+      FakeEventSource.instance = this;
+    }
+
+    addEventListener(type: string, listener: (message: MessageEvent<string>) => void): void {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+    }
+
+    close(): void {}
+
+    emit(type: string, event: unknown): void {
+      for (const listener of this.listeners.get(type) ?? []) {
+        listener({ data: JSON.stringify(event) } as MessageEvent<string>);
+      }
+    }
+  }
+
+  globalThis.fetch = (async (_path, init) => {
+    posted.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
+    return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+  }) as typeof fetch;
+  Object.defineProperty(globalThis, "EventSource", { configurable: true, value: FakeEventSource });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalEventSource) {
+      Object.defineProperty(globalThis, "EventSource", originalEventSource);
+    } else {
+      Reflect.deleteProperty(globalThis, "EventSource");
+    }
+  });
+
+  const bridge = createBridge() as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+  bridge.connectEventStream();
+
+  const accepted = {
+    type: "confirmation",
+    companionId: "bot-1",
+    data: {
+      id: "confirm-1",
+      accepted: true,
+      command: { id: "cmd-confirm", kind: "give_item" },
+    },
+  };
+  FakeEventSource.instance!.emit("confirmation", accepted);
+  FakeEventSource.instance!.emit("confirmation", accepted);
+
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 1);
+
+  await bridge.handleRealtimeEvent(JSON.stringify({
+    type: "response.function_call_arguments.done",
+    call_id: "call-duplicate-give",
+    name: "give_item",
+    arguments: "{\"itemName\":\"cutgrass\"}",
+  }));
+
+  assert.deepEqual(posted, []);
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 1);
+  const duplicateOutput = sent.find((event) => {
+    const item = event.item as { call_id?: string } | undefined;
+    return item?.call_id === "call-duplicate-give";
+  })?.item as { output?: string } | undefined;
+  assert.equal(JSON.parse(duplicateOutput?.output ?? "{}").error.code, "game_action_already_pending");
 });
 
 test("EventSource errors schedule a reconnect instead of immediately closing Realtime", (t) => {
@@ -544,7 +777,37 @@ test("malformed Realtime function arguments stay in the voice session and receiv
   });
 });
 
-test("speech stop restores normal assistant audio but keeps it muted while a game action is pending", async (t) => {
+test("pending gameplay output without a commandId is a recoverable protocol error", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const sent: Array<Record<string, unknown>> = [];
+  globalThis.fetch = (async () => new Response(JSON.stringify({
+    output: JSON.stringify({
+      accepted: true,
+      kind: "gather_nearby",
+      pending: true,
+      waitRecommended: true,
+      feedback: { policy: "issues_only", channel: "voice_only_preamble" },
+    }),
+  }), { status: 200 })) as typeof fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+
+  const bridge = createBridge() as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+
+  await bridge.handleRealtimeEvent(JSON.stringify({
+    type: "response.function_call_arguments.done",
+    call_id: "call-missing-command-id",
+    name: "gather_nearby",
+    arguments: "{}",
+  }));
+
+  assert.deepEqual(sent.map((event) => event.type), ["conversation.item.create", "response.create"]);
+  const item = sent[0]?.item as { output?: string } | undefined;
+  assert.equal(JSON.parse(item?.output ?? "{}").error.code, "pending_command_id_missing");
+});
+
+test("speech stop restores assistant audio even while a game action is pending", async (t) => {
   const originalFetch = globalThis.fetch;
   const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   const sent: Array<Record<string, unknown>> = [];
@@ -558,6 +821,7 @@ test("speech stop restores normal assistant audio but keeps it muted while a gam
           kind: "gather_nearby",
           pending: true,
           waitRecommended: true,
+          feedback: { policy: "issues_only", channel: "voice_only_preamble" },
         }),
       }), { status: 200 });
     }
@@ -593,10 +857,95 @@ test("speech stop restores normal assistant audio but keeps it muted while a gam
     name: "gather_nearby",
     arguments: "{}",
   }));
-  assert.equal(bridge.audio.muted, true);
+  assert.equal(bridge.audio.muted, false);
 
   await bridge.handleRealtimeEvent(JSON.stringify({ type: "input_audio_buffer.speech_started" }));
   await bridge.handleRealtimeEvent(JSON.stringify({ type: "input_audio_buffer.speech_stopped" }));
-  assert.equal(bridge.audio.muted, true);
+  assert.equal(bridge.audio.muted, false);
   assert.equal(sent.some((event) => event.type === "response.cancel"), false);
+});
+
+test("latency callbacks track speech-to-output and tool-to-command-start without transcript data", async (t) => {
+  const originalFetch = globalThis.fetch;
+  const originalEventSource = Object.getOwnPropertyDescriptor(globalThis, "EventSource");
+  const latencies: Array<Record<string, unknown>> = [];
+  const sent: Array<Record<string, unknown>> = [];
+
+  class FakeEventSource {
+    static instance?: FakeEventSource;
+    onerror?: () => void;
+    readonly listeners = new Map<string, Array<(message: MessageEvent<string>) => void>>();
+
+    constructor(_url: string) {
+      FakeEventSource.instance = this;
+    }
+
+    addEventListener(type: string, listener: (message: MessageEvent<string>) => void): void {
+      this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+    }
+
+    close(): void {}
+
+    emit(type: string, event: unknown): void {
+      for (const listener of this.listeners.get(type) ?? []) {
+        listener({ data: JSON.stringify(event) } as MessageEvent<string>);
+      }
+    }
+  }
+
+  globalThis.fetch = (async (_path, init) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+    if (body.type === "tool-call") {
+      return new Response(JSON.stringify({
+        output: JSON.stringify({
+          accepted: true,
+          commandId: "cmd-latency",
+          kind: "gather_nearby",
+          pending: true,
+          waitRecommended: true,
+          feedback: { policy: "issues_only", channel: "voice_only_preamble" },
+        }),
+      }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ accepted: true }), { status: 200 });
+  }) as typeof fetch;
+  Object.defineProperty(globalThis, "EventSource", { configurable: true, value: FakeEventSource });
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+    if (originalEventSource) {
+      Object.defineProperty(globalThis, "EventSource", originalEventSource);
+    } else {
+      Reflect.deleteProperty(globalThis, "EventSource");
+    }
+  });
+
+  const bridge = new RealtimeBridge({
+    onStatus: () => undefined,
+    onTranscript: () => undefined,
+    onGatewayEvent: () => undefined,
+    onLatency: (entry) => latencies.push(entry as unknown as Record<string, unknown>),
+  }, "bot-1") as unknown as BridgeInternals;
+  bridge.session = { sessionId: "local-session" };
+  bridge.channel = { readyState: "open", send: (payload) => sent.push(JSON.parse(payload) as Record<string, unknown>) };
+  bridge.connectEventStream();
+
+  await bridge.handleRealtimeEvent(JSON.stringify({ type: "input_audio_buffer.speech_stopped" }));
+  await bridge.handleRealtimeEvent(JSON.stringify({ type: "response.output_audio_transcript.delta" }));
+
+  await bridge.handleRealtimeEvent(JSON.stringify({
+    type: "response.function_call_arguments.done",
+    call_id: "call-latency",
+    name: "gather_nearby",
+    arguments: "{}",
+  }));
+  FakeEventSource.instance!.emit("command-lifecycle", {
+    type: "command-lifecycle",
+    companionId: "bot-1",
+    data: { id: "cmd-latency", kind: "gather_nearby", status: "started" },
+  });
+
+  assert.deepEqual(latencies.map((entry) => entry.metric), ["speech_to_first_assistant_output", "tool_to_command_start"]);
+  assert.equal(latencies.every((entry) => typeof entry.elapsedMs === "number" && Number(entry.elapsedMs) >= 0), true);
+  assert.equal(latencies.some((entry) => "text" in entry || "transcript" in entry), false);
+  assert.equal(sent.filter((event) => event.type === "response.create").length, 0);
 });

@@ -53,7 +53,8 @@ export async function createRealtimeClientSecret(
             // panel and gives the Chinese voice companion an ISO-639-1 hint.
             transcription: { model: "gpt-4o-mini-transcribe", language: "zh" },
             turn_detection: {
-              type: "server_vad",
+              type: "semantic_vad",
+              eagerness: "high",
               create_response: true,
               interrupt_response: true,
             },

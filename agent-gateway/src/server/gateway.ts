@@ -6,6 +6,8 @@ import type {
   CommandResult,
   CommandStatus,
   CompanionState,
+  FeedbackDirective,
+  FeedbackPolicy,
   GatherProgress,
   PendingConfirmation,
   PlayerInput,
@@ -54,7 +56,7 @@ interface CommandWaiter {
 }
 
 interface PendingTrustedGatherMessage {
-  status: "succeeded" | "partial";
+  status: "succeeded" | "partial" | "failed";
   outcome: GatherProgress;
   text: string;
 }
@@ -146,6 +148,25 @@ const INTERMEDIATE_ASSISTANT_ACKNOWLEDGEMENT = /^(?:我(?:已经)?明白了?|我
 const COMMAND_LIFECYCLE_RETENTION_MS = 5 * 60_000;
 const MAX_COMMAND_WAIT_MS = 10_000;
 
+const GATHER_RESOURCE_LABELS: Record<string, { label: string; unit: string }> = {
+  berrybush: { label: "浆果", unit: "丛" },
+  berrybush2: { label: "多汁浆果", unit: "丛" },
+  berrybush_juicy: { label: "多汁浆果", unit: "丛" },
+  berries: { label: "浆果", unit: "个" },
+  berries_juicy: { label: "多汁浆果", unit: "个" },
+  carrot: { label: "胡萝卜", unit: "个" },
+  cutgrass: { label: "草", unit: "丛" },
+  grass: { label: "草", unit: "丛" },
+  sapling: { label: "树枝", unit: "丛" },
+  twiggytree: { label: "多枝树", unit: "棵" },
+  evergreen: { label: "常青树", unit: "棵" },
+  deciduoustree: { label: "桦栗树", unit: "棵" },
+  rocks: { label: "岩石", unit: "块" },
+  rock1: { label: "岩石", unit: "块" },
+  rock2: { label: "岩石", unit: "块" },
+  flint: { label: "燧石", unit: "块" },
+};
+
 const REALTIME_TOOLS = new Set([
   "get_game_state",
   "search_dst_knowledge",
@@ -160,6 +181,8 @@ const REALTIME_TOOLS = new Set([
   "request_confirmation",
   "clear_action_queue",
 ]);
+
+const FEEDBACK_CHANNEL = "voice_only_preamble" satisfies FeedbackDirective["channel"];
 
 export class GatewayCore {
   private readonly companions = new Map<string, CompanionContext>();
@@ -323,7 +346,12 @@ export class GatewayCore {
       this.publish({
         type: "command-result",
         companionId,
-        data: { result: safeResult, kind: active.command.kind, lifecycle: this.publicCommandLifecycle(context.commandLifecycles.get(safeResult.id)) },
+        data: {
+          result: safeResult,
+          kind: active.command.kind,
+          feedback: this.feedbackForCommand(active.command),
+          lifecycle: this.publicCommandLifecycle(context.commandLifecycles.get(safeResult.id)),
+        },
       });
     }
     return { accepted: true, duplicate: false };
@@ -387,7 +415,11 @@ export class GatewayCore {
       context.confirmation = undefined;
       const command = this.enqueue(companionId, confirmation.command.kind, confirmation.command.args, "player", true);
       this.store.setCompanionMemory(companionId, `preference.${confirmation.command.kind}`, "approved");
-      this.publish({ type: "confirmation", companionId, data: { id: confirmation.id, accepted: true, command } });
+      this.publish({
+        type: "confirmation",
+        companionId,
+        data: { id: confirmation.id, accepted: true, command, feedback: this.feedbackForCommand(command) },
+      });
       return { action: "confirmed", confirmation: confirmation.id };
     }
     if ((lower === "no" || lower === "否" || lower === "取消") && context.confirmation) {
@@ -566,20 +598,24 @@ export class GatewayCore {
       if (cached.name !== name || cached.argsFingerprint !== argsFingerprint) {
         throw new ValidationError("Realtime tool call id was reused with different arguments.");
       }
-      return Promise.resolve({ output: this.withCurrentCommandLifecycle(companionId, cached.output, cached.command), command: cached.command });
+      return Promise.resolve({
+        output: this.ensurePendingCommandId(this.withCurrentCommandLifecycle(companionId, cached.output, cached.command)),
+        command: cached.command,
+      });
     }
 
     return this.runRealtimeTool(companionId, name, rawArgs).then((result) => {
+      const output = this.ensurePendingCommandId(result.output);
       if (cacheKey) {
         this.realtimeToolResults.set(cacheKey, {
           name,
           argsFingerprint,
-          output: result.output,
+          output,
           command: result.command,
           expiresAt: Date.now() + TOOL_CALL_CACHE_TTL_MS,
         });
       }
-      return result;
+      return { output, command: result.command };
     });
   }
 
@@ -611,7 +647,14 @@ export class GatewayCore {
         throw new ValidationError("Confirmation requires an approved command kind.");
       }
       const confirmation = this.requestConfirmation(companionId, args.kind, args.args, args.prompt);
-      return { output: { confirmationId: confirmation.id, status: "awaiting_player", expiresAt: confirmation.expiresAt } };
+      return {
+        output: {
+          confirmationId: confirmation.id,
+          status: "awaiting_player",
+          expiresAt: confirmation.expiresAt,
+          feedback: this.feedbackForCommandKind(args.kind, args.args),
+        },
+      };
     }
 
     const mapping: Record<string, CommandKind> = {
@@ -633,7 +676,14 @@ export class GatewayCore {
     const args = rawArgs && typeof rawArgs === "object" ? rawArgs as Record<string, unknown> : {};
     if (this.requiresConfirmation(kind, args, context.state)) {
       const confirmation = this.requestConfirmation(companionId, kind, args, `确认让伙伴执行 ${kind} 吗？`);
-      return { output: { status: "awaiting_player", confirmationId: confirmation.id, expiresAt: confirmation.expiresAt } };
+      return {
+        output: {
+          status: "awaiting_player",
+          confirmationId: confirmation.id,
+          expiresAt: confirmation.expiresAt,
+          feedback: this.feedbackForCommandKind(kind, args),
+        },
+      };
     }
     if (kind === "stop_and_wait") {
       this.interrupt(companionId, "tool_stop_and_wait");
@@ -868,7 +918,12 @@ export class GatewayCore {
     this.publish({
       type: "command-result",
       companionId: context.id,
-      data: { result, kind: record.command.kind, lifecycle: this.publicCommandLifecycle(context.commandLifecycles.get(record.command.id)) },
+      data: {
+        result,
+        kind: record.command.kind,
+        feedback: this.feedbackForCommand(record.command),
+        lifecycle: this.publicCommandLifecycle(context.commandLifecycles.get(record.command.id)),
+      },
     });
   }
 
@@ -908,6 +963,7 @@ export class GatewayCore {
       completedAt: record.completedAt ?? null,
       progress: record.progress ?? null,
       result: record.result ?? null,
+      feedback: this.feedbackForCommand(record.command),
     };
   }
 
@@ -925,6 +981,7 @@ export class GatewayCore {
       lifecycle,
       result: lifecycle?.result ?? null,
       pending: !terminal,
+      feedback: this.feedbackForCommand(command),
       ...(terminal
         ? {}
         : {
@@ -946,6 +1003,54 @@ export class GatewayCore {
       ...output,
       ...this.realtimeCommandOutput(companionId, command),
     };
+  }
+
+  private ensurePendingCommandId(output: Record<string, unknown>): Record<string, unknown> {
+    if (
+      output.accepted === true
+      && output.pending === true
+      && (typeof output.commandId !== "string" || output.commandId.trim().length === 0)
+    ) {
+      return {
+        ok: false,
+        accepted: false,
+        recoverable: true,
+        error: {
+          code: "gateway_protocol_error",
+          message: "Pending gameplay tool output was missing commandId. Retry the action tool call.",
+        },
+      };
+    }
+    return output;
+  }
+
+  private feedbackForCommand(command: Command): FeedbackDirective {
+    return this.feedbackForCommandKind(command.kind, command.args);
+  }
+
+  private feedbackForCommandKind(kind: CommandKind, args: unknown): FeedbackDirective {
+    const policy = this.feedbackPolicyForCommand(kind, args);
+    return { policy, channel: FEEDBACK_CHANNEL };
+  }
+
+  private feedbackPolicyForCommand(kind: CommandKind, args: unknown): FeedbackPolicy {
+    if (kind === "gather_nearby") {
+      return "issues_only";
+    }
+    if (this.isConfirmedHighRiskAction(kind, args)) {
+      return "always_result";
+    }
+    return "silent_success";
+  }
+
+  private isConfirmedHighRiskAction(kind: CommandKind, args: unknown): boolean {
+    return (
+      (kind === "attack_nearby_threat" || kind === "equip_or_eat" || kind === "give_item")
+      && args !== null
+      && typeof args === "object"
+      && !Array.isArray(args)
+      && (args as Record<string, unknown>).confirmed === true
+    );
   }
 
   private assertResultMatchesCommand(command: Command, result: CommandResult): void {
@@ -1008,15 +1113,15 @@ export class GatewayCore {
     const outcome = result.outcome?.gather;
     if (
       command.kind !== "gather_nearby"
-      || !outcome
-      || (result.status !== "succeeded" && result.status !== "partial")
+      || (result.status !== "succeeded" && result.status !== "partial" && result.status !== "failed")
     ) {
       return;
     }
-    const text = result.status === "succeeded"
-      ? `附近 ${outcome.targetPrefab}：采集 ${outcome.completed} 个，剩余 0。`
-      : `附近 ${outcome.targetPrefab}：采集 ${outcome.completed} 个，剩余 ${outcome.remaining}，跳过 ${outcome.skipped}。`;
-    const message: PendingTrustedGatherMessage = { status: result.status, outcome, text };
+    const text = this.trustedGatherTerminalText(command, result);
+    if (!text) {
+      return;
+    }
+    const message: PendingTrustedGatherMessage = { status: result.status, outcome: outcome ?? this.gatherOutcomeFromCommand(command), text };
     context.pendingTrustedGatherMessages.push(message);
     if (this.hasGameplayWork(context)) {
       this.publish({
@@ -1025,6 +1130,47 @@ export class GatewayCore {
         data: { status: message.status, outcome: { gather: message.outcome }, deferred: true },
       });
     }
+  }
+
+  private trustedGatherTerminalText(command: Command, result: CommandResult): string | undefined {
+    const outcome = result.outcome?.gather;
+    if (result.status === "succeeded") {
+      if (!outcome || outcome.scope !== "all_same_prefab") {
+        return undefined;
+      }
+      const resource = this.gatherResource(outcome.targetPrefab);
+      return `附近 ${resource.label}：已采集 ${outcome.completed}/${outcome.attempted} ${resource.unit}。`;
+    }
+    if (result.status === "partial") {
+      if (!outcome) {
+        return undefined;
+      }
+      const resource = this.gatherResource(outcome.targetPrefab);
+      return `附近 ${resource.label}：采集 ${outcome.completed}/${outcome.attempted} ${resource.unit}，剩余 ${outcome.remaining}，跳过 ${outcome.skipped}。`;
+    }
+    if (result.status === "failed") {
+      const targetPrefab = typeof command.args.targetPrefab === "string" && command.args.targetPrefab.trim()
+        ? command.args.targetPrefab.trim()
+        : "目标";
+      const resource = this.gatherResource(targetPrefab);
+      const reason = result.reason ? `，原因：${result.reason}` : "";
+      return `附近 ${resource.label}：未完成${reason}。`;
+    }
+    return undefined;
+  }
+
+  private gatherResource(targetPrefab: string): { label: string; unit: string } {
+    const canonical = normalizePrefabName(targetPrefab);
+    return GATHER_RESOURCE_LABELS[canonical] ?? { label: canonical || "目标", unit: "个" };
+  }
+
+  private gatherOutcomeFromCommand(command: Command): GatherProgress {
+    const scope = command.args.scope === "all_same_prefab" ? "all_same_prefab" : "single";
+    const mode = command.args.mode === "chop" || command.args.mode === "mine" ? command.args.mode : "collect";
+    const targetPrefab = typeof command.args.targetPrefab === "string" && command.args.targetPrefab.trim()
+      ? normalizePrefabName(command.args.targetPrefab)
+      : "目标";
+    return { scope, mode, targetPrefab, attempted: 0, completed: 0, remaining: 0, skipped: 0 };
   }
 
   private flushTrustedGatherMessages(context: CompanionContext): void {

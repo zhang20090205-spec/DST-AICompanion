@@ -7,6 +7,8 @@ button { border: 0; cursor: pointer; }
 .topbar { min-height: 46px; display: flex; align-items: center; border-bottom: 1px solid #3b4940; gap: 12px; }
 .brand { display: flex; align-items: center; gap: 8px; font-weight: 700; color: #f0f5e8; }
 .realtime-mode { margin-left: auto; color: #9cac9f; font-size: 12px; white-space: nowrap; }
+.latency-strip { display: flex; align-items: center; gap: 6px; color: #b7c8bc; font-size: 12px; white-space: nowrap; }
+.latency-strip span { padding: 3px 6px; border: 1px solid #34423a; background: #1a231e; border-radius: 3px; }
 .status { margin-left: 0; display: flex; align-items: center; gap: 7px; font-size: 13px; color: #bac7bc; }
 .status-dot { width: 8px; height: 8px; background: #84918a; border-radius: 50%; }
 .status.online .status-dot { background: #54c37a; }
@@ -45,4 +47,4 @@ button { border: 0; cursor: pointer; }
 .audit span { white-space: nowrap; padding: 4px 7px; background: #223027; border-radius: 3px; }
 .spin { animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
-@media (max-width: 560px) { .app-shell { padding: 12px; } .realtime-mode { display: none; } .status { margin-left: auto; } .dashboard { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric:nth-child(2) { border-right: 0; } .metric:nth-child(-n+2) { border-bottom: 1px solid #34423a; } .message { width: 90%; } }
+@media (max-width: 560px) { .app-shell { padding: 12px; } .realtime-mode, .latency-strip { display: none; } .status { margin-left: auto; } .dashboard { grid-template-columns: repeat(2, minmax(0, 1fr)); } .metric:nth-child(2) { border-right: 0; } .metric:nth-child(-n+2) { border-bottom: 1px solid #34423a; } .message { width: 90%; } }

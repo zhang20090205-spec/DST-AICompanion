@@ -612,10 +612,17 @@ test("Realtime action tools return a pending lifecycle immediately", async () =>
     status?: string;
     terminal?: boolean;
     pending?: boolean;
+    feedback?: { policy?: string; channel?: string };
   };
   assert.equal(typedOutput.status, "queued");
   assert.equal(typedOutput.terminal, false);
   assert.equal(typedOutput.pending, true);
+  assert.equal(typeof typedOutput.commandId, "string");
+  assert.notEqual(typedOutput.commandId?.trim(), "");
+  assert.deepEqual(typedOutput.feedback, {
+    policy: "silent_success",
+    channel: "voice_only_preamble",
+  });
 
   const command = core.pollCommands("bot-1").commands[0]!;
   assert.equal(command.kind, "follow_player");
@@ -623,6 +630,38 @@ test("Realtime action tools return a pending lifecycle immediately", async () =>
   assert.deepEqual(core.receiveResult("bot-1", { id: command.id, status: "started", stateRevision: 1 }), { accepted: true, duplicate: false });
   assert.deepEqual(core.receiveResult("bot-1", { id: command.id, status: "succeeded", stateRevision: 2 }), { accepted: true, duplicate: false });
 
+  store.close();
+});
+
+test("Realtime feedback policies distinguish gather issues and confirmed high-risk results", async () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-gather", fixtureState());
+  const gather = await core.handleRealtimeTool("bot-gather", "gather_nearby", { mode: "chop", targetGuid: 100 }, "call-gather-feedback");
+  const gatherOutput = gather.output as {
+    commandId?: string;
+    pending?: boolean;
+    feedback?: { policy?: string; channel?: string };
+  };
+  assert.equal(gatherOutput.pending, true);
+  assert.equal(typeof gatherOutput.commandId, "string");
+  assert.notEqual(gatherOutput.commandId?.trim(), "");
+  assert.deepEqual(gatherOutput.feedback, {
+    policy: "issues_only",
+    channel: "voice_only_preamble",
+  });
+
+  core.receiveState("bot-risk", fixtureState());
+  const confirmation = core.requestConfirmation("bot-risk", "attack_nearby_threat", { targetGuid: 102 }, "attack?");
+  assert.deepEqual(core.receivePlayerInput("bot-risk", { text: "yes", source: "game" }), {
+    action: "confirmed",
+    confirmation: confirmation.id,
+  });
+  const confirmed = core.pollCommands("bot-risk").commands[0]!;
+  assert.equal(confirmed.kind, "attack_nearby_threat");
+  assert.deepEqual(core.commandStatus("bot-risk", confirmed.id)?.feedback, {
+    policy: "always_result",
+    channel: "voice_only_preamble",
+  });
   store.close();
 });
 
@@ -663,7 +702,28 @@ test("gather commands canonicalize fresh single and all-same-prefab targets", ()
   });
 });
 
-test("gather progress retains the active command, validates outcomes, and emits trusted terminal speech", async () => {
+test("normal movement successes do not enqueue completion speech", () => {
+  const scenarios = [
+    { companionId: "bot-follow", kind: "follow_player" as const, args: {} },
+    { companionId: "bot-stop", kind: "stop_and_wait" as const, args: {} },
+    { companionId: "bot-approach", kind: "approach_or_retreat" as const, args: { mode: "approach", targetGuid: 9 } },
+  ];
+  const { store, core } = createCore();
+  for (const scenario of scenarios) {
+    core.receiveState(scenario.companionId, fixtureState());
+    const command = core.enqueue(scenario.companionId, scenario.kind, scenario.args, "player");
+    assert.equal(core.pollCommands(scenario.companionId).commands[0]?.id, command.id);
+    assert.deepEqual(core.receiveResult(scenario.companionId, {
+      id: command.id,
+      status: "succeeded",
+      stateRevision: 2,
+    }), { accepted: true, duplicate: false });
+    assert.equal(core.pollCommands(scenario.companionId).commands.length, 0);
+  }
+  store.close();
+});
+
+test("gather progress retains the active command, validates outcomes, and emits trusted partial speech", async () => {
   const { store, core } = createCore();
   core.receiveState("bot-1", fixtureState());
   const events: Array<{ type: string; data: Record<string, unknown> }> = [];
@@ -713,13 +773,13 @@ test("gather progress retains the active command, validates outcomes, and emits 
   assert.equal(core.commandStatus("bot-1", command.id)?.terminal, true);
   const trustedSpeech = core.pollCommands("bot-1").commands[0]!;
   assert.equal(trustedSpeech.kind, "say_in_game");
-  assert.deepEqual(trustedSpeech.args, { text: "附近 evergreen：采集 0 个，剩余 1，跳过 0。" });
+  assert.deepEqual(trustedSpeech.args, { text: "附近 常青树：采集 0/1 棵，剩余 1，跳过 0。" });
   assert.equal(events.some((event) => event.type === "trusted-gather-message" && event.data.deferred === false), true);
 
   store.close();
 });
 
-test("successful gather results require no remaining targets and report deterministic completion speech", () => {
+test("single-target successful gather stays silent", () => {
   const { store, core } = createCore();
   core.receiveState("bot-1", fixtureState());
   const command = core.enqueue("bot-1", "gather_nearby", { mode: "chop", targetGuid: 100 }, "player");
@@ -741,8 +801,45 @@ test("successful gather results require no remaining targets and report determin
     stateRevision: 2,
     outcome,
   }), { accepted: true, duplicate: false });
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
+  store.close();
+});
+
+test("all-same-prefab successful gather reports one factual localized summary", () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+  const command = core.enqueue("bot-1", "gather_nearby", {
+    scope: "all_same_prefab",
+    mode: "chop",
+    targetGuid: 100,
+  }, "player");
+  core.pollCommands("bot-1");
+  const outcome = {
+    gather: {
+      scope: "all_same_prefab",
+      mode: "chop",
+      targetPrefab: "evergreen",
+      attempted: 3,
+      completed: 3,
+      remaining: 0,
+      skipped: 0,
+    },
+  } as const;
+  assert.deepEqual(core.receiveResult("bot-1", {
+    id: command.id,
+    status: "succeeded",
+    stateRevision: 2,
+    outcome,
+  }), { accepted: true, duplicate: false });
   const trustedSpeech = core.pollCommands("bot-1").commands[0]!;
-  assert.deepEqual(trustedSpeech.args, { text: "附近 evergreen：采集 1 个，剩余 0。" });
+  assert.equal(trustedSpeech.kind, "say_in_game");
+  assert.deepEqual(trustedSpeech.args, { text: "附近 常青树：已采集 3/3 棵。" });
+  assert.deepEqual(core.receiveResult("bot-1", {
+    id: trustedSpeech.id,
+    status: "succeeded",
+    stateRevision: 3,
+  }), { accepted: true, duplicate: false });
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
   store.close();
 });
 
@@ -781,8 +878,31 @@ test("skipped gather targets are partial even when no targets remain, and never 
   }), { accepted: true, duplicate: false });
   const trustedSpeech = core.pollCommands("bot-1").commands[0]!;
   assert.equal(trustedSpeech.kind, "say_in_game");
-  assert.deepEqual(trustedSpeech.args, { text: "附近 evergreen：采集 1 个，剩余 0，跳过 1。" });
+  assert.deepEqual(trustedSpeech.args, { text: "附近 常青树：采集 1/2 棵，剩余 0，跳过 1。" });
   assert.doesNotMatch(String(trustedSpeech.args.text), /完成/);
+  store.close();
+});
+
+test("failed gather reports one honest localized issue", () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", fixtureState());
+  const command = core.enqueue("bot-1", "gather_nearby", { mode: "chop", targetGuid: 100 }, "player");
+  core.pollCommands("bot-1");
+  assert.deepEqual(core.receiveResult("bot-1", {
+    id: command.id,
+    status: "failed",
+    reason: "path blocked",
+    stateRevision: 2,
+  }), { accepted: true, duplicate: false });
+  const trustedSpeech = core.pollCommands("bot-1").commands[0]!;
+  assert.equal(trustedSpeech.kind, "say_in_game");
+  assert.deepEqual(trustedSpeech.args, { text: "附近 常青树：未完成，原因：path blocked。" });
+  assert.deepEqual(core.receiveResult("bot-1", {
+    id: trustedSpeech.id,
+    status: "succeeded",
+    stateRevision: 3,
+  }), { accepted: true, duplicate: false });
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
   store.close();
 });
 
@@ -1108,7 +1228,7 @@ test("Realtime client-secret proxy uses the server key without returning it", as
       audio?: {
         input?: {
           transcription?: { model?: string; language?: string };
-          turn_detection?: { type?: string; interrupt_response?: boolean };
+          turn_detection?: { type?: string; eagerness?: string; create_response?: boolean; interrupt_response?: boolean };
         };
         output?: { voice?: string };
       };
@@ -1123,7 +1243,9 @@ test("Realtime client-secret proxy uses the server key without returning it", as
     model: "gpt-4o-mini-transcribe",
     language: "zh",
   });
-  assert.equal(requestBody.session?.audio?.input?.turn_detection?.type, "server_vad");
+  assert.equal(requestBody.session?.audio?.input?.turn_detection?.type, "semantic_vad");
+  assert.equal(requestBody.session?.audio?.input?.turn_detection?.eagerness, "high");
+  assert.equal(requestBody.session?.audio?.input?.turn_detection?.create_response, true);
   assert.equal(requestBody.session?.audio?.input?.turn_detection?.interrupt_response, true);
   assert.equal(requestBody.session?.audio?.output?.voice, config.realtimeVoice);
 });

@@ -127,12 +127,12 @@ test("GPT Agent keeps one runtime brain and safely interrupts risky actions", as
 	assert.match(gpt, /AI_SPEECH_MIN_INTERVAL_MS/);
 });
 
-test("GPT Agent cancels every legacy periodic FAtiMA task before its own loop runs", async () => {
+test("GPT Agent never starts the legacy FAtiMA loop before its own poll runs", async () => {
 	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
 
-	for (const task of ["PerceptionsTask", "DSTActionTask", "SpeakActionTask", "visiontask"]) {
-		assert.match(gpt, new RegExp(`if self\\.${task} ~= nil then\\s+self\\.${task}:Cancel\\(\\)`, "m"));
-	}
+	assert.doesNotMatch(gpt, /LegacyBrain\.OnStart\(self\)/);
+	assert.doesNotMatch(gpt, /LegacyBrain\.OnStop\(self\)/);
+	assert.match(gpt, /Do not call LegacyBrain\.OnStart here/);
 	assert.match(gpt, /local STATE_POST_INTERVAL = 0\.5/);
 	assert.match(gpt, /self\.GatewayStateTask = self\.inst:DoPeriodicTask\(STATE_POST_INTERVAL, self\.OnGatewayStatePost, 0\)/);
 	assert.match(gpt, /function GPTAgentBrain:OnStop\(\)/);
@@ -162,18 +162,16 @@ test("Gateway failures interrupt local actions and leave the companion standing 
 	assert.match(gpt, /self:EnterGatewayStandby\("player input forward failed"\)/);
 });
 
-test("GPT Agent handles simple follow chat commands locally", async () => {
+test("ordinary !ai text is forwarded to Gateway without a local follow shortcut", async () => {
 	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
 
-	assert.match(gpt, /local LOCAL_FOLLOW_TEXT =/);
-	assert.match(gpt, /follow = true/);
-	assert.match(gpt, /\["follow me"\] = true/);
-	assert.match(gpt, /elseif LOCAL_FOLLOW_TEXT\[normalized\] then/);
-	assert.match(gpt, /self:SetCommandLeader\(userid\)/);
-	assert.match(gpt, /self:EnsurePlayerTarget\(nil\)/);
-	assert.match(gpt, /self:InterruptLocalAction\("local player follow", true\)/);
-	assert.match(gpt, /self\.UttAction = "Follow"/);
-	assert.match(gpt, /self:SayAI\("Following\."\)/);
+	assert.match(gpt, /self:ForwardPlayerInput\(text, userid\)/);
+	assert.match(gpt, /if LOCAL_STOP_TEXT\[normalized\] then/);
+	assert.match(gpt, /self:InterruptLocalAction\("local player stop", true\)/);
+	assert.doesNotMatch(gpt, /LOCAL_FOLLOW_TEXT/);
+	assert.doesNotMatch(gpt, /local player follow/);
+	assert.doesNotMatch(gpt, /SayAI\("Following\."\)/);
+	assert.doesNotMatch(gpt, /SayAI\("Stopping\."\)/);
 });
 
 test("Lua revalidates rare gives and honors entity movement targets", async () => {
@@ -199,8 +197,11 @@ test("gather commands report started, emit progress, and only finish after the l
 	assert.match(gpt, /local MAX_GATHER_TARGETS = 40/);
 	assert.match(gpt, /local MAX_GATHER_RESULT_TARGETS = 10000/);
 	assert.match(gpt, /function GPTAgentBrain:RefreshGatherSession\(session\)/);
+	assert.match(gpt, /function GPTAgentBrain:IsGatherTargetInRange\(session, entity\)/);
+	assert.match(gpt, /local leader = self:EnsurePlayerTarget\(nil\)[\s\S]*?leader:GetDistanceSqToInst\(entity\)\) <= NEARBY_RANGE/);
+	assert.match(gpt, /return nil, "player is not nearby"/);
 	assert.match(gpt, /session\.scope == "all_same_prefab"/);
-	assert.match(gpt, /CanonicalPrefab\(entity\.prefab\) == session\.targetPrefab/);
+	assert.match(gpt, /CanonicalPrefab\(entity\.prefab\) ~= session\.targetPrefab/);
 	assert.match(gpt, /session\.overflowGuids\[guid\] = true/);
 	assert.match(gpt, /session\.remaining = #candidates \+ self:GatherOverflowCount\(session\)/);
 	assert.match(gpt, /function GPTAgentBrain:StartNextGatherTarget\(target\)/);
@@ -228,11 +229,15 @@ test("active command cancellation and expiry produce honest terminal states", as
 	assert.match(gpt, /self:CompleteActiveCommand\("cancelled", "action cleared"\)/);
 });
 
-test("movement and in-game speech do not claim success until their observable effects exist", async () => {
+test("follow reports mode enablement once while movement and game speech retain honest effects", async () => {
 	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
+	const movementCompletion = gpt.match(/function GPTAgentBrain:CheckMovementCommandCompletion\(\)([\s\S]*?)\nend\n\nfunction GPTAgentBrain:ShouldKeepBufferedCommandWorking/);
 
 	assert.match(gpt, /function GPTAgentBrain:CheckMovementCommandCompletion\(\)/);
-	assert.match(gpt, /math\.sqrt\(self\.inst:GetDistanceSqToInst\(leader\)\) <= FOLLOW_COMPLETE_RANGE/);
+	assert.ok(movementCompletion);
+	assert.doesNotMatch(gpt, /FOLLOW_COMPLETE_RANGE/);
+	assert.doesNotMatch(movementCompletion[1], /follow_player/);
+	assert.match(gpt, /self\.UttAction = "Follow"[\s\S]*?return false/);
 	assert.match(gpt, /distance >= RETREAT_COMPLETE_RANGE/);
 	assert.match(gpt, /distance <= APPROACH_COMPLETE_RANGE/);
 	assert.match(gpt, /if not self:SayAI\(text\) then\s+return nil, "in-game speech could not be delivered"\s+end/m);

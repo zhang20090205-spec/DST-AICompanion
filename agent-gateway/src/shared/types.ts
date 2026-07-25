@@ -13,12 +13,16 @@ export const COMMAND_KINDS = [
 export const COMMAND_PRIORITIES = ["interrupt", "player", "autonomy"] as const;
 export const GATHER_SCOPES = ["single", "all_same_prefab"] as const;
 export const GATHER_MODES = ["collect", "chop", "mine"] as const;
+export const FEEDBACK_POLICIES = ["silent_success", "issues_only", "always_result"] as const;
+export const FEEDBACK_CHANNELS = ["voice_only_preamble"] as const;
 
 export type CommandKind = (typeof COMMAND_KINDS)[number];
 export type CommandPriority = (typeof COMMAND_PRIORITIES)[number];
 export type GatherScope = (typeof GATHER_SCOPES)[number];
 export type GatherMode = (typeof GATHER_MODES)[number];
 export type CommandStatus = "started" | "progress" | "succeeded" | "partial" | "failed" | "cancelled";
+export type FeedbackPolicy = (typeof FEEDBACK_POLICIES)[number];
+export type FeedbackChannel = (typeof FEEDBACK_CHANNELS)[number];
 
 export interface Position {
   x: number;
@@ -94,6 +98,11 @@ export interface CommandResult {
   reason?: string;
   stateRevision: number;
   outcome?: CommandOutcome;
+}
+
+export interface FeedbackDirective {
+  policy: FeedbackPolicy;
+  channel: FeedbackChannel;
 }
 
 export interface PlayerInput {

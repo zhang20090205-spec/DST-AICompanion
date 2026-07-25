@@ -1,7 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { AudioLines, Check, CircleAlert, CircleStop, LoaderCircle, Mic, MicOff, Send, X } from "lucide-react";
-import { type ConnectionStatus, type GatewayEvent, type TranscriptEntry, RealtimeBridge } from "./realtime";
+import { AudioLines, Check, CircleAlert, CircleStop, LoaderCircle, Mic, MicOff, Send, Timer, X } from "lucide-react";
+import {
+  type ConnectionStatus,
+  type GatewayEvent,
+  type RealtimeLatencyEntry,
+  type TranscriptEntry,
+  RealtimeBridge,
+} from "./realtime";
 import "./styles.css";
 
 interface VisibleState {
@@ -38,6 +44,11 @@ const STATUS_LABEL: Record<ConnectionStatus, string> = {
   error: "连接异常",
 };
 
+const LATENCY_LABEL: Record<RealtimeLatencyEntry["metric"], string> = {
+  speech_to_first_assistant_output: "首响",
+  tool_to_command_start: "动作",
+};
+
 function App() {
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const [detail, setDetail] = useState("");
@@ -47,12 +58,14 @@ function App() {
   const [audit, setAudit] = useState<string[]>([]);
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const [realtimeMode, setRealtimeMode] = useState<{ model?: string; reasoningEffort?: string }>({});
+  const [latency, setLatency] = useState<RealtimeLatencyEntry[]>([]);
   const bridge = useRef<RealtimeBridge | undefined>(undefined);
 
   const indicator = useMemo(() => status === "connected" ? "online" : status === "connecting" ? "pending" : "offline", [status]);
 
   const addAudit = (entry: string) => setAudit((current) => [entry, ...current].slice(0, 8));
   const addTranscript = (entry: TranscriptEntry) => setTranscript((current) => [...current, entry].slice(-30));
+  const addLatency = (entry: RealtimeLatencyEntry) => setLatency((current) => [entry, ...current].slice(0, 3));
 
   useEffect(() => {
     let disposed = false;
@@ -124,6 +137,7 @@ function App() {
         },
         onTranscript: addTranscript,
         onGatewayEvent: handleGatewayEvent,
+        onLatency: addLatency,
       });
     }
     try {
@@ -184,6 +198,14 @@ function App() {
         <div className="realtime-mode" title="低推理等级优先响应速度；可在 .env 中设置 OPENAI_REALTIME_REASONING_EFFORT=high 获得更深推理和更高延迟。">
           {realtimeMode.model ?? "Realtime"} · 推理 {realtimeMode.reasoningEffort ?? "--"}
         </div>
+        {latency.length > 0 && (
+          <div className="latency-strip" aria-label="实时延迟">
+            <Timer size={14} />
+            {latency.map((entry) => (
+              <span key={entry.id}>{LATENCY_LABEL[entry.metric]} {entry.elapsedMs}ms</span>
+            ))}
+          </div>
+        )}
         <div className={`status ${indicator}`}><span className="status-dot" />{STATUS_LABEL[status]}</div>
         {status === "connected" ? (
           <button className="icon-button" type="button" title="断开语音" onClick={() => void disconnect()}><MicOff size={18} /></button>

@@ -15,7 +15,6 @@ local MAX_INVENTORY = 40
 local MAX_TEXT_LENGTH = 120
 local MAX_RESULT_REASON = 160
 local AI_SPEECH_MIN_INTERVAL_MS = 500
-local FOLLOW_COMPLETE_RANGE = 3
 local APPROACH_COMPLETE_RANGE = 10
 local RETREAT_COMPLETE_RANGE = 15
 
@@ -80,13 +79,6 @@ local LOCAL_STOP_TEXT = {
 	["停止"] = true,
 	["停下"] = true,
 	["别动"] = true,
-}
-
-local LOCAL_FOLLOW_TEXT = {
-	follow = true,
-	["follow me"] = true,
-	come = true,
-	["come here"] = true,
 }
 
 local LOCAL_YES_TEXT = {
@@ -413,15 +405,6 @@ function GPTAgentBrain:CheckMovementCommandCompletion()
 	if command == nil then
 		return
 	end
-	if command.kind == "follow_player" then
-		local leader = self:GetLeader()
-		if not IsVisibleEntity(leader) then
-			self:CompleteActiveCommand("failed", "follow player is unavailable")
-		elseif math.sqrt(self.inst:GetDistanceSqToInst(leader)) <= FOLLOW_COMPLETE_RANGE then
-			self:CompleteActiveCommand("succeeded")
-		end
-		return
-	end
 	if command.kind ~= "approach_or_retreat" then
 		return
 	end
@@ -547,23 +530,23 @@ function GPTAgentBrain:CreateGPTActionTree()
 end
 
 function GPTAgentBrain:OnStart()
-	LegacyBrain.OnStart(self)
-	if self.PerceptionsTask ~= nil then
-		self.PerceptionsTask:Cancel()
-		self.PerceptionsTask = nil
+	-- Do not call LegacyBrain.OnStart here.  That starts the old FAtiMA HTTP
+	-- perception/decision/speech timers and registers its autonomous callbacks.
+	-- The GPT brain only reuses safe DST helper methods from the legacy class;
+	-- its runtime loop is entirely the Gateway state post + command poll below.
+	if self.inst.entity ~= nil then
+		self.inst.entity:SetCanSleep(false)
 	end
-	if self.DSTActionTask ~= nil then
-		self.DSTActionTask:Cancel()
-		self.DSTActionTask = nil
+	if self.inst.components.trader ~= nil then
+		self.inst.components.trader:Enable()
 	end
-	if self.SpeakActionTask ~= nil then
-		self.SpeakActionTask:Cancel()
-		self.SpeakActionTask = nil
+	if self.inst.components.combat ~= nil then
+		self.inst.components.combat.lastattacker = nil
 	end
-	if self.visiontask ~= nil then
-		self.visiontask:Cancel()
-		self.visiontask = nil
+	if self:GetLeader() == nil then
+		self:SetPlayerCharacter()
 	end
+	self:SetLeader()
 	self:CreateGPTActionTree()
 	if self.GatewayStateTask ~= nil then
 		self.GatewayStateTask:Cancel()
@@ -601,7 +584,8 @@ function GPTAgentBrain:OnStop()
 		self.visiontask:Cancel()
 		self.visiontask = nil
 	end
-	LegacyBrain.OnStop(self)
+	-- LegacyBrain.OnStop removes listeners created by LegacyBrain.OnStart. They
+	-- are intentionally never registered in GPT mode, so do not invoke it.
 end
 
 function GPTAgentBrain:BuildCompactState()
@@ -879,7 +863,10 @@ function GPTAgentBrain:ApplyCommand(command)
 		self:InterruptLocalAction("follow player", false)
 		self.UttAction = "Follow"
 		self.Utterance = "follow"
-		return true
+		-- Following is a persistent mode, not a navigation task that becomes
+		-- complete only when a distance threshold happens to be crossed.  Report
+		-- that the mode was enabled now; the Follow behaviour below keeps running.
+		return false
 	elseif command.kind == "stop_and_wait" then
 		self:InterruptLocalAction("stop and wait", false)
 		self.UttAction = "Stop"
@@ -937,10 +924,19 @@ function GPTAgentBrain:EnsurePlayerTarget(target_guid)
 end
 
 function GPTAgentBrain:IsGatherTargetInRange(session, entity)
-	return entity ~= self.inst
-		and IsGatherableEntity(entity, session.mode)
-		and CanonicalPrefab(entity.prefab) == session.targetPrefab
-		and math.sqrt(self.inst:GetDistanceSqToInst(entity)) <= NEARBY_RANGE
+	if entity == self.inst
+		or not IsGatherableEntity(entity, session.mode)
+		or CanonicalPrefab(entity.prefab) ~= session.targetPrefab
+		or math.sqrt(self.inst:GetDistanceSqToInst(entity)) > NEARBY_RANGE then
+		return false
+	end
+	-- “Nearby” is the companion's local sensory radius, but a bulk gather must
+	-- not pull it away from the player.  If the player moves away mid-session,
+	-- the remaining entities become skipped and the truthful terminal result is
+	-- partial instead of silently wandering after them.
+	local leader = self:EnsurePlayerTarget(nil)
+	return IsValidEntity(leader)
+		and math.sqrt(leader:GetDistanceSqToInst(entity)) <= NEARBY_RANGE
 end
 
 function GPTAgentBrain:ResolveGatherTarget(mode, target_guid, target_prefab)
@@ -1173,6 +1169,10 @@ end
 
 function GPTAgentBrain:ApplyGatherCommand(command)
 	local args = command.args or {}
+	local leader = self:EnsurePlayerTarget(nil)
+	if not IsValidEntity(leader) or math.sqrt(self.inst:GetDistanceSqToInst(leader)) > NEARBY_RANGE then
+		return nil, "player is not nearby"
+	end
 	local mode = "collect"
 	if args.mode == "chop" or args.mode == "mine" then
 		mode = args.mode
@@ -1534,17 +1534,6 @@ function GPTAgentBrain:QueueTextCommand(text, userid)
 		self:InterruptLocalAction("local player stop", true)
 		self.UttAction = "Stop"
 		self.Utterance = "stop"
-		self:SayAI("Stopping.")
-		return true
-	elseif LOCAL_FOLLOW_TEXT[normalized] then
-		if type(userid) == "string" and self.SetCommandLeader ~= nil then
-			self:SetCommandLeader(userid)
-		end
-		self:EnsurePlayerTarget(nil)
-		self:InterruptLocalAction("local player follow", true)
-		self.UttAction = "Follow"
-		self.Utterance = "follow"
-		self:SayAI("Following.")
 		return true
 	elseif LOCAL_YES_TEXT[normalized] then
 		return true
