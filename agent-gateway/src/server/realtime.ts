@@ -55,8 +55,13 @@ export async function createRealtimeClientSecret(
             turn_detection: {
               type: "semantic_vad",
               eagerness: "high",
-              create_response: true,
-              interrupt_response: true,
+              // VAD still marks turn boundaries, but the browser routes the
+              // completed transcript first and explicitly decides whether to
+              // create a Realtime response. Keeping this in sync with the
+              // browser session.update prevents an early audio event from
+              // auto-replying or cancelling a DST action during connection.
+              create_response: false,
+              interrupt_response: false,
             },
           },
           output: { voice: config.realtimeVoice },

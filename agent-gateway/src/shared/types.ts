@@ -33,6 +33,8 @@ export interface NearbyEntity {
   guid: number;
   prefab: string;
   distance: number;
+  position?: Position;
+  playerDistance?: number;
   tags: string[];
   collectable?: boolean;
   choppable?: boolean;
@@ -105,11 +107,31 @@ export interface FeedbackDirective {
   channel: FeedbackChannel;
 }
 
+export type PlayerInputAction = "forwarded" | "duplicate" | "interrupted" | "confirmed" | "rejected" | "routed" | "blocked";
+export type PlayerInputRoute = "realtime" | "local_safety" | "confirmation" | "fast_intent";
+
+export interface SafeCommandSummary {
+  id: string;
+  kind: CommandKind;
+  args: Record<string, unknown>;
+  feedback: FeedbackDirective;
+}
+
 export interface PlayerInput {
   id?: string;
   userid?: string;
   text: string;
   source: "game" | "voice" | "browser";
+}
+
+export interface PlayerInputReceipt {
+  action: PlayerInputAction;
+  inputId?: string;
+  route?: PlayerInputRoute;
+  intent?: string;
+  reason?: string;
+  confirmation?: string;
+  command?: SafeCommandSummary;
 }
 
 export interface PendingConfirmation {

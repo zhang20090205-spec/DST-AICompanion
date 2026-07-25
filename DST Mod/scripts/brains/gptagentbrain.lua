@@ -624,17 +624,23 @@ function GPTAgentBrain:BuildCompactState()
 	end
 
 	local nearby = {}
-	local nearby_count = 0
+	local nearby_candidates = {}
 	local is_near_danger = false
 	local ents = TheSim:FindEntities(x, 0, z, NEARBY_RANGE, nil, { "INLIMBO", "NOCLICK", "CLASSIFIED", "FX" }, nil)
 	for _, entity in ipairs(ents or {}) do
-		if nearby_count < MAX_NEARBY and entity ~= self.inst and IsVisibleEntity(entity) and type(entity.prefab) == "string" then
+		if entity ~= self.inst and IsVisibleEntity(entity) and type(entity.prefab) == "string" then
 			local distance = math.sqrt(self.inst:GetDistanceSqToInst(entity))
 			local attackable = self.inst.components.combat ~= nil and self.inst.components.combat:CanAttack(entity) or false
+			local player_distance = nil
+			if IsValidEntity(leader) then
+				player_distance = math.sqrt(leader:GetDistanceSqToInst(entity))
+			end
 			local record = {
 				guid = EntityGuid(entity),
 				prefab = SafeText(entity.prefab, 64),
 				distance = Clamp(distance, 0, 250, 250),
+				position = EntityPosition(entity),
+				playerDistance = player_distance ~= nil and Clamp(player_distance, 0, 250, 250) or nil,
 				tags = EntityTags(entity),
 				collectable = entity:HasTag("pickable") or (entity.components ~= nil and entity.components.inventoryitem ~= nil and entity.components.inventoryitem.canbepickedup and not entity:HasTag("heavy")),
 				choppable = entity:HasTag("CHOP_workable"),
@@ -644,13 +650,21 @@ function GPTAgentBrain:BuildCompactState()
 				equippable = entity:HasTag("_equippable"),
 			}
 			if record.guid ~= nil and record.prefab ~= "" then
-				nearby_count = nearby_count + 1
-				nearby[nearby_count] = record
+				nearby_candidates[#nearby_candidates + 1] = record
 				if distance <= 12 and attackable and HasAnyHostileLabel(entity) then
 					is_near_danger = true
 				end
 			end
 		end
+	end
+	table.sort(nearby_candidates, function(left, right)
+		if left.distance == right.distance then
+			return left.guid < right.guid
+		end
+		return left.distance < right.distance
+	end)
+	for index = 1, math.min(#nearby_candidates, MAX_NEARBY) do
+		nearby[index] = nearby_candidates[index]
 	end
 
 	local player = {
@@ -941,12 +955,18 @@ end
 
 function GPTAgentBrain:ResolveGatherTarget(mode, target_guid, target_prefab)
 	local canonical_prefab = CanonicalPrefab(target_prefab)
+	local leader = self:EnsurePlayerTarget(nil)
+	local function is_valid_target(entity)
+		return entity ~= self.inst
+			and IsGatherableEntity(entity, mode)
+			and math.sqrt(self.inst:GetDistanceSqToInst(entity)) <= NEARBY_RANGE
+			and IsValidEntity(leader)
+			and math.sqrt(leader:GetDistanceSqToInst(entity)) <= NEARBY_RANGE
+			and (canonical_prefab == "" or CanonicalPrefab(entity.prefab) == canonical_prefab)
+	end
 	if IsFiniteNumber(target_guid) then
 		local target = Ents[math.floor(target_guid)]
-		if target ~= self.inst
-			and IsGatherableEntity(target, mode)
-			and math.sqrt(self.inst:GetDistanceSqToInst(target)) <= NEARBY_RANGE
-			and (canonical_prefab == "" or CanonicalPrefab(target.prefab) == canonical_prefab) then
+		if is_valid_target(target) then
 			return target
 		end
 		return nil
@@ -957,9 +977,7 @@ function GPTAgentBrain:ResolveGatherTarget(mode, target_guid, target_prefab)
 	local best = nil
 	local best_distance = nil
 	for _, entity in ipairs(ents or {}) do
-		if entity ~= self.inst
-			and IsGatherableEntity(entity, mode)
-			and (canonical_prefab == "" or CanonicalPrefab(entity.prefab) == canonical_prefab) then
+		if is_valid_target(entity) then
 			local distance = self.inst:GetDistanceSqToInst(entity)
 			if best == nil or distance < best_distance then
 				best = entity

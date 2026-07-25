@@ -72,7 +72,7 @@ test("GPT Agent command validation covers kind priority epoch and ttl", async ()
 });
 
 test("GPT Agent reports compact state and command results", async () => {
-  const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
+	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
 
   for (const field of [
     "health",
@@ -96,7 +96,19 @@ test("GPT Agent reports compact state and command results", async () => {
   assert.match(gpt, /"started"/);
   assert.match(gpt, /"succeeded"/);
   assert.match(gpt, /"failed"/);
-  assert.match(gpt, /"cancelled"/);
+	assert.match(gpt, /"cancelled"/);
+});
+
+test("compact nearby state is distance-sorted and carries the player leash used by gather validation", async () => {
+	const gpt = await readModFile("scripts", "brains", "gptagentbrain.lua");
+
+	assert.match(gpt, /local nearby_candidates = \{\}/);
+	assert.match(gpt, /nearby_candidates\[#nearby_candidates \+ 1\] = record/);
+	assert.match(gpt, /table\.sort\(nearby_candidates, function\(left, right\)[\s\S]*?left\.distance == right\.distance[\s\S]*?left\.guid < right\.guid/);
+	assert.match(gpt, /for index = 1, math\.min\(#nearby_candidates, MAX_NEARBY\) do/);
+	assert.match(gpt, /playerDistance = player_distance ~= nil/);
+	assert.match(gpt, /function GPTAgentBrain:ResolveGatherTarget\(mode, target_guid, target_prefab\)/);
+	assert.match(gpt, /math\.sqrt\(leader:GetDistanceSqToInst\(entity\)\) <= NEARBY_RANGE/);
 });
 
 test("GPT Agent dispatch is whitelisted and does not execute dynamic code", async () => {

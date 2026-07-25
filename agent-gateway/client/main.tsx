@@ -28,13 +28,20 @@ interface Confirmation {
 
 interface GatewayHealthCompanion {
   id?: string;
+  connected?: boolean;
   confirmation?: Confirmation | null;
+}
+
+interface GatewayAuditEvent {
+  event?: string;
+  metadata?: Record<string, unknown>;
 }
 
 interface GatewayHealth {
   companions?: GatewayHealthCompanion[];
   model?: string;
   reasoningEffort?: string;
+  audit?: GatewayAuditEvent[];
 }
 
 const STATUS_LABEL: Record<ConnectionStatus, string> = {
@@ -47,6 +54,8 @@ const STATUS_LABEL: Record<ConnectionStatus, string> = {
 const LATENCY_LABEL: Record<RealtimeLatencyEntry["metric"], string> = {
   speech_to_first_assistant_output: "首响",
   tool_to_command_start: "动作",
+  transcript_to_gateway_route: "路由",
+  transcript_to_command_start: "下发",
 };
 
 function App() {
@@ -59,6 +68,10 @@ function App() {
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const [realtimeMode, setRealtimeMode] = useState<{ model?: string; reasoningEffort?: string }>({});
   const [latency, setLatency] = useState<RealtimeLatencyEntry[]>([]);
+  const [gameConnection, setGameConnection] = useState<{ fresh: boolean; reason: string }>({
+    fresh: false,
+    reason: "等待 DST 上报状态",
+  });
   const bridge = useRef<RealtimeBridge | undefined>(undefined);
 
   const indicator = useMemo(() => status === "connected" ? "online" : status === "connecting" ? "pending" : "offline", [status]);
@@ -77,8 +90,21 @@ function App() {
         }
         const health = await response.json() as GatewayHealth;
         const companion = health.companions?.find((candidate) => candidate.id === "default");
+        const interruption = health.audit?.find((entry) => entry.event === "interrupted" || entry.event === "command_cancelled");
+        const interruptionReason = typeof interruption?.metadata?.reason === "string"
+          ? interruption.metadata.reason
+          : "";
         if (!disposed) {
           setConfirmation(companion?.confirmation ?? null);
+          setGame((current) => ({ ...current, connected: companion?.connected === true }));
+          setGameConnection(companion?.connected === true
+            ? { fresh: true, reason: "DST 状态已连接" }
+            : {
+                fresh: false,
+                reason: interruptionReason
+                  ? `DST 状态已过期；最近取消：${interruptionReason}`
+                  : "DST 状态未连接或已过期，不能安全下发游戏动作",
+              });
           setRealtimeMode({
             model: typeof health.model === "string" ? health.model : undefined,
             reasoningEffort: typeof health.reasoningEffort === "string" ? health.reasoningEffort : undefined,
@@ -223,8 +249,13 @@ function App() {
         <div className="metric"><span>饥饿</span><strong>{game.hunger ?? "--"}</strong></div>
         <div className="metric"><span>理智</span><strong>{game.sanity ?? "--"}</strong></div>
         <div className="metric"><span>温度</span><strong>{game.temperature ?? "--"}</strong></div>
-        <div className="state-line"><span>{game.phase ?? "等待游戏状态"}</span><span>{game.action ?? "待命"}</span></div>
+        <div className="state-line">
+          <span>{game.phase ?? "等待游戏状态"}</span><span>{game.action ?? "待命"}</span>
+          <span title={gameConnection.reason}>{gameConnection.fresh ? "DST 已连接" : "DST 状态不可用"}</span>
+        </div>
       </section>
+
+      {!gameConnection.fresh && <div className="notice"><CircleAlert size={16} /><span>{gameConnection.reason}</span></div>}
 
       {confirmation && <section className="confirmation">
         <CircleAlert size={18} /><span>{confirmation.prompt}</span>

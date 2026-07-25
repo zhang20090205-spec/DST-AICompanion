@@ -31,7 +31,7 @@ function fixtureState() {
     IsDay: true,
     IsBusy: false,
     Entities: [
-      { GUID: 100, Prefab: "evergreen", Distance: 7, Choppable: true },
+      { GUID: 100, Prefab: "evergreen", Distance: 7, PlayerDistance: 8, Choppable: true },
       { GUID: 101, Prefab: "spider", Distance: 8, Attackable: true, tags: ["monster"] },
       { GUID: 102, Prefab: "beefalo", Distance: 7, Attackable: true },
     ],
@@ -189,7 +189,9 @@ test("confirmation expires after twenty seconds and player input is never persis
   core.receiveState("bot-1", fixtureState());
   const confirmation = core.requestConfirmation("bot-1", "attack_nearby_threat", { targetGuid: 102 }, "攻击这只牛吗？");
   core.watchdog(confirmation.expiresAt + 1);
-  assert.deepEqual(core.receivePlayerInput("bot-1", { text: "是", source: "game" }), { action: "forwarded" });
+  const expiredReply = core.receivePlayerInput("bot-1", { text: "是", source: "game" });
+  assert.equal(expiredReply.action, "forwarded");
+  assert.equal(expiredReply.route, "realtime");
   const privateText = "this transcript must never persist";
   core.receivePlayerInput("bot-1", { id: "unique-input", text: privateText, source: "voice" });
   assert.equal(JSON.stringify(store.recentAudit()).includes(privateText), false);
@@ -210,7 +212,11 @@ test("accepted confirmations add internal confirmed marker after sanitizing comm
   assert.throws(() => core.enqueue("bot-1", "attack_nearby_threat", { targetGuid: 103, confirmed: true }, "player"), ValidationError);
 
   const confirmation = core.requestConfirmation("bot-1", "attack_nearby_threat", { targetGuid: 103, confirmed: true, injected: "ignore" }, "confirm attack?");
-  assert.deepEqual(core.receivePlayerInput("bot-1", { text: "yes", source: "game" }), { action: "confirmed", confirmation: confirmation.id });
+  const accepted = core.receivePlayerInput("bot-1", { text: "yes", source: "game" });
+  assert.equal(accepted.action, "confirmed");
+  assert.equal(accepted.route, "confirmation");
+  assert.equal(accepted.confirmation, confirmation.id);
+  assert.equal(accepted.command?.kind, "attack_nearby_threat");
   assert.equal(store.getCompanionMemory("bot-1", "preference.attack_nearby_threat"), "approved");
   const command = core.pollCommands("bot-1").commands[0]!;
   assert.equal(command.kind, "attack_nearby_threat");
@@ -221,19 +227,255 @@ test("accepted confirmations add internal confirmed marker after sanitizing comm
 test("Chinese stop and confirmation words take the local safety paths", () => {
   const { store, core } = createCore();
   core.receiveState("bot-1", fixtureState());
-  assert.deepEqual(core.receivePlayerInput("bot-1", { text: "停止", source: "game" }), { action: "interrupted" });
+  const stop = core.receivePlayerInput("bot-1", { text: "停止", source: "game" });
+  assert.equal(stop.action, "interrupted");
+  assert.equal(stop.route, "fast_intent");
+  assert.equal(stop.command?.kind, "clear_action_queue");
 
   const confirmation = core.requestConfirmation("bot-1", "attack_nearby_threat", { targetGuid: 102 }, "确认攻击吗？");
-  assert.deepEqual(core.receivePlayerInput("bot-1", { text: "是", source: "game" }), {
-    action: "confirmed",
-    confirmation: confirmation.id,
-  });
+  const accepted = core.receivePlayerInput("bot-1", { text: "是", source: "game" });
+  assert.equal(accepted.action, "confirmed");
+  assert.equal(accepted.route, "confirmation");
+  assert.equal(accepted.confirmation, confirmation.id);
 
   const secondConfirmation = core.requestConfirmation("bot-1", "attack_nearby_threat", { targetGuid: 102 }, "确认攻击吗？");
-  assert.deepEqual(core.receivePlayerInput("bot-1", { text: "否", source: "game" }), {
-    action: "rejected",
-    confirmation: secondConfirmation.id,
+  const rejected = core.receivePlayerInput("bot-1", { text: "否", source: "game" });
+  assert.equal(rejected.action, "rejected");
+  assert.equal(rejected.route, "confirmation");
+  assert.equal(rejected.confirmation, secondConfirmation.id);
+  store.close();
+});
+
+test("fast intent router immediately routes safe Chinese movement and resource commands without raw SSE transcripts", () => {
+  const { store, core } = createCore();
+  const events: Array<{ type: string; companionId?: string; data: Record<string, unknown> }> = [];
+  core.subscribe((event) => events.push(event));
+  const resourceEntities = [
+    { GUID: 401, Prefab: "grass", Distance: 6, PlayerDistance: 5, Collectable: true },
+    { GUID: 402, Prefab: "berrybush", Distance: 7, PlayerDistance: 7, Collectable: true },
+    { GUID: 403, Prefab: "sapling", Distance: 8, PlayerDistance: 9, Collectable: true },
+    { GUID: 404, Prefab: "cutgrass", Distance: 1, PlayerDistance: 1, Collectable: true },
+    { GUID: 405, Prefab: "berries", Distance: 1, PlayerDistance: 1, Collectable: true },
+    { GUID: 406, Prefab: "twigs", Distance: 1, PlayerDistance: 1, Collectable: true },
+  ];
+  const scenarios = [
+    {
+      companionId: "fast-follow",
+      text: "跟着我",
+      source: "game" as const,
+      expectedKind: "follow_player",
+      expectedArgs: {},
+    },
+    {
+      companionId: "fast-approach",
+      text: "过来",
+      source: "browser" as const,
+      expectedKind: "approach_or_retreat",
+      expectedArgs: { mode: "approach", targetGuid: 9 },
+    },
+    {
+      companionId: "fast-grass",
+      text: "把所有草都采了",
+      source: "voice" as const,
+      expectedKind: "gather_nearby",
+      expectedArgs: { mode: "collect", scope: "all_same_prefab", targetGuid: 401, targetPrefab: "grass" },
+    },
+    {
+      companionId: "fast-berries",
+      text: "采浆果",
+      source: "game" as const,
+      expectedKind: "gather_nearby",
+      expectedArgs: { mode: "collect", scope: "single", targetGuid: 402, targetPrefab: "berrybush" },
+    },
+    {
+      companionId: "fast-twigs",
+      text: "捡树枝",
+      source: "voice" as const,
+      expectedKind: "gather_nearby",
+      expectedArgs: { mode: "collect", scope: "single", targetGuid: 403, targetPrefab: "sapling" },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    core.receiveState(scenario.companionId, { ...fixtureState(), Entities: resourceEntities });
+    const receipt = core.receivePlayerInput(scenario.companionId, {
+      id: `${scenario.companionId}-input`,
+      text: scenario.text,
+      source: scenario.source,
+    });
+    assert.equal(receipt.action, "routed");
+    assert.equal(receipt.route, "fast_intent");
+    assert.equal(receipt.inputId, `${scenario.companionId}-input`);
+    assert.equal(receipt.command?.kind, scenario.expectedKind);
+    assert.deepEqual(receipt.command?.args, scenario.expectedArgs);
+
+    const command = core.pollCommands(scenario.companionId).commands[0]!;
+    assert.equal(command.kind, scenario.expectedKind);
+    assert.deepEqual(command.args, scenario.expectedArgs);
+    const event = events.filter((entry) => entry.type === "player-input" && entry.companionId === scenario.companionId).at(-1);
+    assert.equal(event?.data.route, "fast_intent");
+    assert.equal("text" in (event?.data ?? {}), false);
+  }
+  store.close();
+});
+
+test("fast gather blocks stale, ambiguous, dropped-item, and player-far resource targets", () => {
+  withFakeNow(5_000_000, (clock) => {
+    const { store, core } = createCore();
+    const events: Array<{ type: string; companionId?: string; data: Record<string, unknown> }> = [];
+    core.subscribe((event) => events.push(event));
+
+    core.receiveState("bot-stale", {
+      ...fixtureState(),
+      Entities: [{ GUID: 501, Prefab: "grass", Distance: 5, PlayerDistance: 5, Collectable: true }],
+    });
+    clock.advance(5_001);
+    const stale = core.receivePlayerInput("bot-stale", { text: "采草", source: "voice" });
+    assert.equal(stale.action, "blocked");
+    assert.equal(stale.reason, "stale_state");
+    const staleFollow = core.receivePlayerInput("bot-stale", { text: "跟着我", source: "game" });
+    assert.equal(staleFollow.action, "blocked");
+    assert.equal(staleFollow.reason, "stale_state");
+    assert.equal(core.pollCommands("bot-stale").commands.length, 0);
+
+    core.receiveState("bot-ambiguous", {
+      ...fixtureState(),
+      Entities: [
+        { GUID: 502, Prefab: "grass", Distance: 5, PlayerDistance: 5, Collectable: true },
+        { GUID: 503, Prefab: "sapling", Distance: 6, PlayerDistance: 6, Collectable: true },
+      ],
+    });
+    const ambiguous = core.receivePlayerInput("bot-ambiguous", { text: "采草和树枝", source: "game" });
+    assert.equal(ambiguous.action, "blocked");
+    assert.equal(ambiguous.reason, "ambiguous_intent");
+    assert.equal(core.pollCommands("bot-ambiguous").commands.length, 0);
+
+    core.receiveState("bot-drops", {
+      ...fixtureState(),
+      Entities: [
+        { GUID: 504, Prefab: "cutgrass", Distance: 1, PlayerDistance: 1, Collectable: true },
+        { GUID: 505, Prefab: "berries", Distance: 1, PlayerDistance: 1, Collectable: true },
+        { GUID: 506, Prefab: "twigs", Distance: 1, PlayerDistance: 1, Collectable: true },
+      ],
+    });
+    const droppedItem = core.receivePlayerInput("bot-drops", { text: "采草", source: "game" });
+    assert.equal(droppedItem.action, "blocked");
+    assert.equal(droppedItem.reason, "target_unavailable");
+
+    core.receiveState("bot-player-far", {
+      ...fixtureState(),
+      Entities: [{ GUID: 507, Prefab: "grass", Distance: 5, PlayerDistance: 22, Collectable: true }],
+    });
+    const playerFar = core.receivePlayerInput("bot-player-far", { text: "采草", source: "voice" });
+    assert.equal(playerFar.action, "blocked");
+    assert.equal(playerFar.reason, "target_unavailable");
+    assert.throws(() => core.enqueue("bot-player-far", "gather_nearby", { mode: "collect", targetGuid: 507 }, "player"), ValidationError);
+    core.receiveState("bot-player-far", { ...fixtureState(), Distance: 22 });
+    const farApproach = core.receivePlayerInput("bot-player-far", { text: "过来", source: "game" });
+    assert.equal(farApproach.action, "blocked");
+    assert.equal(farApproach.reason, "target_unavailable");
+    const ambiguousEnglishWait = core.receivePlayerInput("bot-player-far", { text: "wait a second", source: "voice" });
+    assert.equal(ambiguousEnglishWait.action, "forwarded");
+    assert.equal(ambiguousEnglishWait.route, "realtime");
+    assert.equal(core.pollCommands("bot-player-far").commands.length, 0);
+    // The fast router and command validator use the same approach boundary.
+    // A target just outside the validator's range must be clarified, never
+    // accepted locally only to fail while queueing the command.
+    core.receiveState("bot-approach-boundary", { ...fixtureState(), Distance: 21 });
+    const approachBoundary = core.receivePlayerInput("bot-approach-boundary", { text: "过来", source: "voice" });
+    assert.equal(approachBoundary.action, "blocked");
+    assert.equal(approachBoundary.reason, "target_unavailable");
+    assert.equal(core.pollCommands("bot-approach-boundary").commands.length, 0);
+    const routedEvents = events.filter((event) => event.type === "player-input" && event.data.action === "routed");
+    assert.equal(routedEvents.every((event) => !("text" in event.data)), true);
+    const blockedGameInput = events.find((event) => event.type === "player-input" && event.companionId === "bot-ambiguous");
+    assert.equal(blockedGameInput?.data.action, "blocked");
+    assert.equal(blockedGameInput?.data.text, "采草和树枝");
+    store.close();
   });
+});
+
+test("fast intents do not cancel pending high-risk confirmations", () => {
+  const { store, core } = createCore();
+  const events: Array<{ type: string; companionId?: string; data: Record<string, unknown> }> = [];
+  core.subscribe((event) => events.push(event));
+  core.receiveState("bot-1", {
+    ...fixtureState(),
+    Entities: [
+      ...fixtureState().Entities,
+      { GUID: 401, Prefab: "grass", Distance: 6, PlayerDistance: 5, Collectable: true },
+    ],
+  });
+  const confirmation = core.requestConfirmation("bot-1", "attack_nearby_threat", { targetGuid: 102 }, "确认攻击吗？");
+  const receipt = core.receivePlayerInput("bot-1", { id: "pending-gather", text: "采草", source: "voice" });
+  assert.equal(receipt.action, "forwarded");
+  assert.equal(receipt.route, "realtime");
+  assert.equal(receipt.reason, "pending_confirmation");
+  assert.equal(core.pollCommands("bot-1").commands.length, 0);
+  const status = core.status().companions as Array<{ id?: string; confirmation?: { id?: string } | null }>;
+  assert.equal(status.find((entry) => entry.id === "bot-1")?.confirmation?.id, confirmation.id);
+  const event = events.filter((entry) => entry.type === "player-input").at(-1);
+  assert.equal(event?.data.route, "realtime");
+  assert.equal(event?.data.reason, "pending_confirmation");
+  store.close();
+});
+
+test("blocked fast follow cannot be bypassed through a Realtime tool call", async () => {
+  const { store, core } = createCore();
+  const blocked = core.receivePlayerInput("bot-stale-follow", { text: "跟着我", source: "voice" });
+  assert.equal(blocked.action, "blocked");
+  assert.equal(blocked.reason, "stale_state");
+  await assert.rejects(
+    core.handleRealtimeTool("bot-stale-follow", "follow_player", {}, "stale-follow-tool"),
+    ValidationError,
+  );
+  assert.equal(core.pollCommands("bot-stale-follow").commands.length, 0);
+
+  core.receiveState("bot-no-player-follow", { ...fixtureState(), PlayerGUID: null, Distance: null });
+  const unavailable = core.receivePlayerInput("bot-no-player-follow", { text: "跟着我", source: "game" });
+  assert.equal(unavailable.action, "blocked");
+  assert.equal(unavailable.reason, "target_unavailable");
+  await assert.rejects(
+    core.handleRealtimeTool("bot-no-player-follow", "follow_player", {}, "no-player-follow-tool"),
+    ValidationError,
+  );
+  assert.equal(core.pollCommands("bot-no-player-follow").commands.length, 0);
+  store.close();
+});
+
+test("fast player input dedupes, replaces active player work, and blocks duplicate Realtime gameplay tools", async () => {
+  const { store, core } = createCore();
+  core.receiveState("bot-1", {
+    ...fixtureState(),
+    Entities: [
+      ...fixtureState().Entities,
+      { GUID: 401, Prefab: "grass", Distance: 6, PlayerDistance: 5, Collectable: true },
+    ],
+  });
+  const first = core.receivePlayerInput("bot-1", { id: "fast-follow-once", text: "跟着我", source: "voice" });
+  const duplicate = core.receivePlayerInput("bot-1", { id: "fast-follow-once", text: "跟着我", source: "voice" });
+  assert.equal(first.action, "routed");
+  assert.equal(duplicate.action, "duplicate");
+  assert.equal(core.pollCommands("bot-1").commands[0]?.id, first.command?.id);
+  core.receiveResult("bot-1", { id: first.command!.id, status: "succeeded", stateRevision: 1 });
+
+  const active = core.enqueue("bot-1", "gather_nearby", { mode: "chop", targetGuid: 100 }, "player");
+  assert.equal(core.pollCommands("bot-1").commands[0]?.id, active.id);
+  const replacement = core.receivePlayerInput("bot-1", { id: "replace-with-follow", text: "跟着我", source: "game" });
+  assert.equal(replacement.action, "routed");
+  assert.equal(replacement.command?.kind, "follow_player");
+  assert.equal(core.commandStatus("bot-1", active.id)?.status, "cancelled");
+
+  const blockedTool = await core.handleRealtimeTool("bot-1", "gather_nearby", { mode: "collect", targetGuid: 401 }, "call-during-fast");
+  assert.equal(blockedTool.output.accepted, false);
+  assert.equal(blockedTool.output.route, "fast_intent");
+
+  const clear = core.pollCommands("bot-1").commands[0]!;
+  assert.equal(clear.kind, "clear_action_queue");
+  core.receiveResult("bot-1", { id: clear.id, status: "succeeded", stateRevision: 2 });
+  const follow = core.pollCommands("bot-1").commands[0]!;
+  assert.equal(follow.id, replacement.command?.id);
+  assert.equal(follow.kind, "follow_player");
   store.close();
 });
 
@@ -374,8 +616,66 @@ test("HTTP contract exposes state, commands, results, and natural language input
   core.enqueue("bot-1", "follow_player", {}, "player");
   const commands = await app.inject({ method: "GET", url: "/api/dst/v1/companions/bot-1/commands" });
   assert.equal(commands.json().commands[0].kind, "follow_player");
-  const input = await app.inject({ method: "POST", url: "/api/dst/v1/companions/bot-1/player-input", payload: { text: "跟着我", source: "game" } });
+  const input = await app.inject({ method: "POST", url: "/api/dst/v1/companions/bot-1/player-input", payload: { text: "你好", source: "game" } });
   assert.equal(input.json().action, "forwarded");
+  assert.equal(input.json().route, "realtime");
+  await app.close();
+  store.close();
+});
+
+test("HTTP and Realtime transcript APIs expose fast-route receipts and queue safe commands", async () => {
+  const { store, core } = createCore();
+  const app = createGatewayApp(config, core);
+  core.receiveState("bot-http", {
+    ...fixtureState(),
+    Entities: [{ GUID: 401, Prefab: "grass", Distance: 6, PlayerDistance: 5, Collectable: true }],
+  });
+
+  const input = await app.inject({
+    method: "POST",
+    url: "/api/dst/v1/companions/bot-http/player-input",
+    payload: { id: "api-gather", text: "采所有草", source: "browser" },
+  });
+  assert.equal(input.statusCode, 200);
+  assert.equal(input.json().action, "routed");
+  assert.equal(input.json().route, "fast_intent");
+  assert.equal(input.json().inputId, "api-gather");
+  assert.equal(input.json().command.kind, "gather_nearby");
+  assert.deepEqual(input.json().command.args, {
+    mode: "collect",
+    scope: "all_same_prefab",
+    targetGuid: 401,
+    targetPrefab: "grass",
+  });
+  assert.equal(core.pollCommands("bot-http").commands[0]?.id, input.json().command.id);
+
+  core.receiveState("bot-voice", {
+    ...fixtureState(),
+    Entities: [{ GUID: 402, Prefab: "berrybush", Distance: 6, PlayerDistance: 5, Collectable: true }],
+  });
+  const voiceTranscript = await app.inject({
+    method: "POST",
+    url: "/api/dst/v1/companions/bot-voice/player-input/transcript",
+    payload: { id: "voice-berries", text: "采浆果", source: "browser" },
+  });
+  assert.equal(voiceTranscript.statusCode, 200);
+  assert.equal(voiceTranscript.json().route, "fast_intent");
+  assert.equal(voiceTranscript.json().command.kind, "gather_nearby");
+  assert.equal(voiceTranscript.json().command.args.targetPrefab, "berrybush");
+
+  const session = core.registerBrowserSession();
+  core.receiveState("bot-rt", fixtureState());
+  const transcript = await app.inject({
+    method: "POST",
+    url: "/api/realtime/events",
+    payload: { sessionId: session.sessionId, companionId: "bot-rt", type: "transcript", text: "过来" },
+  });
+  assert.equal(transcript.statusCode, 200);
+  assert.equal(transcript.json().action, "routed");
+  assert.equal(transcript.json().route, "fast_intent");
+  assert.equal(transcript.json().command.kind, "approach_or_retreat");
+  assert.equal(core.pollCommands("bot-rt").commands[0]?.id, transcript.json().command.id);
+
   await app.close();
   store.close();
 });
@@ -652,10 +952,10 @@ test("Realtime feedback policies distinguish gather issues and confirmed high-ri
 
   core.receiveState("bot-risk", fixtureState());
   const confirmation = core.requestConfirmation("bot-risk", "attack_nearby_threat", { targetGuid: 102 }, "attack?");
-  assert.deepEqual(core.receivePlayerInput("bot-risk", { text: "yes", source: "game" }), {
-    action: "confirmed",
-    confirmation: confirmation.id,
-  });
+  const accepted = core.receivePlayerInput("bot-risk", { text: "yes", source: "game" });
+  assert.equal(accepted.action, "confirmed");
+  assert.equal(accepted.route, "confirmation");
+  assert.equal(accepted.confirmation, confirmation.id);
   const confirmed = core.pollCommands("bot-risk").commands[0]!;
   assert.equal(confirmed.kind, "attack_nearby_threat");
   assert.deepEqual(core.commandStatus("bot-risk", confirmed.id)?.feedback, {
@@ -671,9 +971,9 @@ test("gather commands canonicalize fresh single and all-same-prefab targets", ()
     core.receiveState("bot-1", {
       ...fixtureState(),
       Entities: [
-        { GUID: 401, Prefab: "grass", Distance: 10, Collectable: true },
-        { GUID: 402, Prefab: "grass", Distance: 21, Collectable: true },
-        { GUID: 403, Prefab: "grass", Distance: 22, Collectable: true },
+        { GUID: 401, Prefab: "grass", Distance: 10, PlayerDistance: 9, Collectable: true },
+        { GUID: 402, Prefab: "grass", Distance: 21, PlayerDistance: 12, Collectable: true },
+        { GUID: 403, Prefab: "grass", Distance: 22, PlayerDistance: 13, Collectable: true },
       ],
     });
 
@@ -994,6 +1294,7 @@ test("Realtime tool-call ids dedupe command enqueueing and invalid calls have no
   const { store, core } = createCore();
   const app = createGatewayApp(config, core);
   const session = core.registerBrowserSession();
+  core.receiveState("bot-1", fixtureState());
   const payload = {
     sessionId: session.sessionId,
     companionId: "bot-1",
@@ -1245,8 +1546,8 @@ test("Realtime client-secret proxy uses the server key without returning it", as
   });
   assert.equal(requestBody.session?.audio?.input?.turn_detection?.type, "semantic_vad");
   assert.equal(requestBody.session?.audio?.input?.turn_detection?.eagerness, "high");
-  assert.equal(requestBody.session?.audio?.input?.turn_detection?.create_response, true);
-  assert.equal(requestBody.session?.audio?.input?.turn_detection?.interrupt_response, true);
+  assert.equal(requestBody.session?.audio?.input?.turn_detection?.create_response, false);
+  assert.equal(requestBody.session?.audio?.input?.turn_detection?.interrupt_response, false);
   assert.equal(requestBody.session?.audio?.output?.voice, config.realtimeVoice);
 });
 

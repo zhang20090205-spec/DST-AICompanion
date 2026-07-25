@@ -60,7 +60,7 @@ The default chat prefix is `!ai`.
 | `!ai 跟着我，附近有树就砍一棵` | Sends natural-language intent to the Gateway/Realtime session. |
 | `!ai stop` or `!ai 停下` | Stops immediately in Lua, then notifies the Gateway. |
 | `!ai yes` / `!ai no` | Accepts or rejects an active high-risk confirmation. |
-| Browser microphone | Chinese Semantic VAD interaction (`high` eagerness); player speech interrupts the current reply and game action. |
+| Browser microphone | Chinese Semantic VAD interaction (`high` eagerness). Speaking interrupts only the current AI audio reply; it does not cancel an in-progress game action. Say “停止” or “停下” to stop the action. |
 
 The companion can speak in a bubble and emits `[AI]` messages into DST chat. Its
 allowed actions are follow, stop, approach/retreat, nearby ordinary gathering,
@@ -75,6 +75,12 @@ source of completion: ordinary successful follow/stop/movement actions stay
 quiet, while “collect all of this prefab” produces one factual `[AI]` result
 with the real count. Partial or failed gathers report the actual unfinished work
 instead of pretending success.
+
+The local fast path recognizes `停止/停下`、`跟着我`、`过来` and nearby
+`草/浆果/树枝` collection. Add `全部`、`所有` or `都` to collect every
+reachable instance of one exact prefab. These commands are validated against a
+fresh local game state and are sent to the Mod immediately; unclear, unavailable,
+or high-risk requests are handed to Realtime for a short clarification instead.
 
 ## Safety contract
 
@@ -102,9 +108,10 @@ npm run typecheck
 npm run build
 ```
 
-Manual game checks: issue `!ai stop` during a movement action, speak while the
-companion is responding, verify the action ends by the next poll, and confirm no
-Lua errors are reported in the DST log.
+Manual game checks: issue `!ai 把附近浆果都采了`, speak while the companion is
+collecting and verify it continues, then say `停止` (or use `!ai stop`) and
+verify the action ends by the next poll. Confirm that no Lua errors are reported
+in the DST log.
 
 ## Upstream references
 

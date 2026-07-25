@@ -18,7 +18,12 @@ import {
 const MAX_CHAT_LENGTH = 120;
 const MAX_NEARBY = 40;
 const MAX_INVENTORY = 40;
-const MAX_DISTANCE = 20;
+// Keep movement validation and the deterministic fast router on the same
+// boundary so a locally accepted "come here" request cannot fail during
+// enqueue because the two layers disagree about what is nearby.
+export const MAX_MOVEMENT_DISTANCE = 20;
+export const MAX_FOLLOW_DISTANCE = 21;
+const MAX_DISTANCE = MAX_MOVEMENT_DISTANCE;
 const MAX_GATHER_DISTANCE = 21;
 const MAX_GATHER_TARGETS = 40;
 const MAX_GATHER_RESULT_TARGETS = 10_000;
@@ -80,6 +85,19 @@ function normalizePosition(value: unknown): { x: number; z: number } {
   };
 }
 
+function normalizeOptionalPosition(value: unknown): { x: number; z: number } | undefined {
+  const source = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const rawX = source.x ?? source.X;
+  const rawZ = source.z ?? source.Z;
+  if (finiteNumber(rawX) === null || finiteNumber(rawZ) === null) {
+    return undefined;
+  }
+  return {
+    x: boundedNumber(rawX, -10_000, 10_000),
+    z: boundedNumber(rawZ, -10_000, 10_000),
+  };
+}
+
 function normalizeNearby(value: unknown): NearbyEntity[] {
   if (!Array.isArray(value)) {
     return [];
@@ -96,10 +114,14 @@ function normalizeNearby(value: unknown): NearbyEntity[] {
       return [];
     }
     const rawTags = Array.isArray(source.tags) ? source.tags : [];
+    const position = normalizeOptionalPosition(source.position ?? { x: source.x ?? source.X, z: source.z ?? source.Z });
+    const playerDistance = finiteNumber(source.playerDistance ?? source.PlayerDistance ?? source.distanceToPlayer ?? source.DistanceToPlayer);
     return [{
       guid: Math.floor(guid),
       prefab,
       distance: boundedNumber(source.distance ?? source.Distance, 0, 250),
+      ...(position ? { position } : {}),
+      ...(playerDistance !== null ? { playerDistance: boundedNumber(playerDistance, 0, 250) } : {}),
       tags: rawTags.filter((tag): tag is string => typeof tag === "string").map((tag) => text(tag, 32)).filter(Boolean).slice(0, 12),
       collectable: Boolean(source.collectable ?? source.Collectable ?? source.pickable ?? source.Pickable),
       choppable: Boolean(source.choppable ?? source.Choppable),
@@ -220,7 +242,7 @@ export function targetFromState(state: CompanionState | undefined, value: unknow
   if (purpose === "attack" && !candidate.attackable) {
     return undefined;
   }
-  if (purpose === "gather" && !(candidate.collectable || candidate.choppable || candidate.mineable)) {
+  if (purpose === "gather" && !isGatherTargetAvailable(state, candidate)) {
     return undefined;
   }
   return candidate;
@@ -234,6 +256,23 @@ function supportsGatherMode(entity: NearbyEntity, mode: GatherMode): boolean {
     return entity.mineable === true;
   }
   return entity.collectable === true;
+}
+
+export function isGatherTargetAvailable(state: CompanionState, entity: NearbyEntity, mode?: GatherMode): boolean {
+  const gatherMode = mode ?? (entity.choppable ? "chop" : entity.mineable ? "mine" : "collect");
+  return entity.distance <= MAX_GATHER_DISTANCE
+    && supportsGatherMode(entity, gatherMode)
+    && gatherPlayerDistance(state, entity) <= MAX_GATHER_DISTANCE;
+}
+
+function gatherPlayerDistance(state: CompanionState, entity: NearbyEntity): number {
+  if (typeof entity.playerDistance === "number" && Number.isFinite(entity.playerDistance)) {
+    return entity.playerDistance;
+  }
+  if (!state.player.position || !entity.position) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.hypot(entity.position.x - state.player.position.x, entity.position.z - state.player.position.z);
 }
 
 function canonicalGatherTarget(
@@ -262,7 +301,7 @@ function canonicalGatherTarget(
   }
 
   const candidates = state.nearby
-    .filter((entity) => entity.distance <= MAX_GATHER_DISTANCE && supportsGatherMode(entity, mode))
+    .filter((entity) => isGatherTargetAvailable(state, entity, mode))
     .sort((left, right) => left.distance - right.distance || left.guid - right.guid);
   const target = targetGuid === undefined
     ? candidates.find((entity) => targetPrefab === undefined || canonicalPrefab(entity.prefab) === targetPrefab)
@@ -286,11 +325,17 @@ export function validateCommandArgs(
   if (kind === "say_in_game") {
     return { text: sanitizeChat(args.text) };
   }
-  if (kind === "clear_action_queue" || kind === "stop_and_wait" || kind === "follow_player") {
+  if (kind === "clear_action_queue" || kind === "stop_and_wait") {
     return {};
   }
   if (!hasFreshState(state)) {
     throw new ValidationError("Game state is unavailable or stale.");
+  }
+  if (kind === "follow_player") {
+    if (!state.player.guid || state.player.distance === null || state.player.distance > MAX_FOLLOW_DISTANCE) {
+      throw new ValidationError("The player must be nearby before follow can be enabled.");
+    }
+    return {};
   }
   if (kind === "approach_or_retreat") {
     const mode = args.mode === "retreat" ? "retreat" : "approach";

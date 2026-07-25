@@ -122,6 +122,22 @@ export function createGatewayApp(config: GatewayConfig, core: GatewayCore): Fast
     });
   });
 
+  // Audio transcription uses the same deterministic player-input path as
+  // browser text and `!ai`, but a dedicated local alias lets the browser mark
+  // its source without first receiving a 404 fallback round-trip.
+  app.post<{ Params: CompanionParams; Body: PlayerInput }>("/api/dst/v1/companions/:id/player-input/transcript", async (request) => {
+    const body = asRecord(request.body);
+    if (typeof body.text !== "string") {
+      throw new ValidationError("Player input must contain text.");
+    }
+    return core.receivePlayerInput(request.params.id, {
+      id: typeof body.id === "string" ? body.id : undefined,
+      userid: typeof body.userid === "string" ? body.userid : undefined,
+      text: body.text,
+      source: "voice",
+    });
+  });
+
   app.post<{ Body: { companionId?: string } }>("/api/realtime/session", async (request) => {
     const body = asRecord(request.body);
     const companionId = typeof body.companionId === "string" ? body.companionId : "default";

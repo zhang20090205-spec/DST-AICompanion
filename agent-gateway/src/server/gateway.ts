@@ -11,8 +11,11 @@ import type {
   GatherProgress,
   PendingConfirmation,
   PlayerInput,
+  PlayerInputReceipt,
+  SafeCommandSummary,
 } from "../shared/types.js";
 import { GatewayStore } from "./database.js";
+import { FastIntentRouter } from "./fast-intent-router.js";
 import {
   ValidationError,
   boundedExpiry,
@@ -71,6 +74,7 @@ interface CompanionContext {
   commandWaiters: Map<string, Set<CommandWaiter>>;
   pendingTrustedGatherMessages: PendingTrustedGatherMessage[];
   trustedGatherSpeechCommandIds: Set<string>;
+  fastPlayerCommandIds: Set<string>;
   confirmation?: PendingConfirmation;
   voiceConnected: boolean;
   voiceSpeaking: boolean;
@@ -158,6 +162,7 @@ const GATHER_RESOURCE_LABELS: Record<string, { label: string; unit: string }> = 
   cutgrass: { label: "草", unit: "丛" },
   grass: { label: "草", unit: "丛" },
   sapling: { label: "树枝", unit: "丛" },
+  sapling_moon: { label: "树枝", unit: "丛" },
   twiggytree: { label: "多枝树", unit: "棵" },
   evergreen: { label: "常青树", unit: "棵" },
   deciduoustree: { label: "桦栗树", unit: "棵" },
@@ -182,6 +187,16 @@ const REALTIME_TOOLS = new Set([
   "clear_action_queue",
 ]);
 
+const NON_STOP_REALTIME_GAMEPLAY_TOOLS = new Set([
+  "follow_player",
+  "approach_or_retreat",
+  "gather_nearby",
+  "attack_nearby_threat",
+  "equip_or_eat",
+  "give_item",
+  "request_confirmation",
+]);
+
 const FEEDBACK_CHANNEL = "voice_only_preamble" satisfies FeedbackDirective["channel"];
 
 export class GatewayCore {
@@ -190,6 +205,7 @@ export class GatewayCore {
   private readonly listeners = new Set<(event: GatewayEvent) => void>();
   private readonly seenInputIds = new Map<string, number>();
   private readonly realtimeToolResults = new Map<string, RealtimeToolRecord>();
+  private readonly fastIntentRouter = new FastIntentRouter();
 
   constructor(readonly store: GatewayStore) {}
 
@@ -394,21 +410,32 @@ export class GatewayCore {
     return this.publicCommandLifecycle(record);
   }
 
-  receivePlayerInput(companionId: string, input: PlayerInput): { action: string; confirmation?: string } {
+  receivePlayerInput(companionId: string, input: PlayerInput): PlayerInputReceipt {
     const normalized = sanitizeChat(input.text);
-    const dedupeId = input.id?.slice(0, 128);
-    if (dedupeId && this.seenInputIds.get(dedupeId) && Date.now() - (this.seenInputIds.get(dedupeId) ?? 0) < 60_000) {
-      return { action: "duplicate" };
+    const inputId = this.safePlayerInputId(input.id);
+    const dedupeKey = inputId ? `${companionId}:${inputId}` : undefined;
+    if (dedupeKey && this.seenInputIds.get(dedupeKey) && Date.now() - (this.seenInputIds.get(dedupeKey) ?? 0) < 60_000) {
+      return { action: "duplicate", inputId, route: "local_safety" };
     }
-    if (dedupeId) {
-      this.seenInputIds.set(dedupeId, Date.now());
+    if (dedupeKey) {
+      this.seenInputIds.set(dedupeKey, Date.now());
     }
     const context = this.context(companionId);
+    this.expire(context);
     const lower = normalized.toLowerCase();
     if (lower === "stop" || lower === "停止" || lower === "停下" || lower === "别动") {
-      this.interrupt(companionId, "player_stop");
-      this.publish({ type: "player-input", companionId, data: { text: normalized, source: input.source, action: "interrupted" } });
-      return { action: "interrupted" };
+      const command = this.interrupt(companionId, "player_stop");
+      this.markFastPlayerCommand(context, command);
+      const receipt: PlayerInputReceipt = {
+        action: "interrupted",
+        inputId,
+        route: "fast_intent",
+        intent: "stop",
+        reason: "player_stop",
+        command: this.safeCommandSummary(command),
+      };
+      this.publishSafePlayerInput(companionId, input.source, receipt);
+      return receipt;
     }
     if ((lower === "yes" || lower === "是" || lower === "确认") && context.confirmation) {
       const confirmation = context.confirmation;
@@ -420,7 +447,13 @@ export class GatewayCore {
         companionId,
         data: { id: confirmation.id, accepted: true, command, feedback: this.feedbackForCommand(command) },
       });
-      return { action: "confirmed", confirmation: confirmation.id };
+      return {
+        action: "confirmed",
+        inputId,
+        route: "confirmation",
+        confirmation: confirmation.id,
+        command: this.safeCommandSummary(command),
+      };
     }
     if ((lower === "no" || lower === "否" || lower === "取消") && context.confirmation) {
       const confirmation = context.confirmation;
@@ -428,11 +461,67 @@ export class GatewayCore {
       this.store.setCompanionMemory(companionId, `preference.${confirmation.command.kind}`, "declined");
       this.store.addAudit(companionId, "confirmation_rejected", { id: confirmation.id });
       this.publish({ type: "confirmation", companionId, data: { id: confirmation.id, accepted: false } });
-      return { action: "rejected", confirmation: confirmation.id };
+      return {
+        action: "rejected",
+        inputId,
+        route: "confirmation",
+        confirmation: confirmation.id,
+        reason: "player_declined",
+      };
+    }
+    const fastRoute = this.fastIntentRouter.route(normalized, context.state);
+    if (context.confirmation && fastRoute.status !== "none" && fastRoute.intent !== "stop") {
+      const receipt: PlayerInputReceipt = {
+        action: "forwarded",
+        inputId,
+        route: "realtime",
+        reason: "pending_confirmation",
+      };
+      this.publish({
+        type: "player-input",
+        companionId,
+        data: { ...receipt, text: normalized, source: input.source, userid: input.userid ?? null },
+      });
+      return receipt;
+    }
+    if (fastRoute.status === "blocked") {
+      const receipt: PlayerInputReceipt = {
+        action: "blocked",
+        inputId,
+        route: "fast_intent",
+        intent: fastRoute.intent,
+        reason: fastRoute.reason,
+      };
+      // A blocked fast-path request must be passed to Realtime for a concise
+      // clarification. The text is only broadcast live (never audited or
+      // persisted), just like other model-routed player input.
+      this.publish({
+        type: "player-input",
+        companionId,
+        data: { ...receipt, text: normalized, source: input.source, userid: input.userid ?? null },
+      });
+      return receipt;
+    }
+    if (fastRoute.status === "matched") {
+      const command = fastRoute.intent === "stop"
+        ? this.interrupt(companionId, "player_stop")
+        : this.enqueueFastPlayerCommand(companionId, fastRoute.command.kind, fastRoute.command.args);
+      this.markFastPlayerCommand(this.context(companionId), command);
+      const receipt: PlayerInputReceipt = {
+        action: fastRoute.intent === "stop" ? "interrupted" : "routed",
+        inputId,
+        route: "fast_intent",
+        intent: fastRoute.intent,
+        reason: fastRoute.reason,
+        command: this.safeCommandSummary(command),
+      };
+      this.publishSafePlayerInput(companionId, input.source, receipt);
+      return receipt;
     }
     // Transcript text is intentionally only sent to live SSE subscribers, never persisted.
-    this.publish({ type: "player-input", companionId, data: { text: normalized, source: input.source, userid: input.userid ?? null } });
-    return { action: "forwarded" };
+    const receipt: PlayerInputReceipt = { action: "forwarded", inputId, route: "realtime" };
+    this.publish({ type: "player-input", companionId, data: { ...receipt, text: normalized, source: input.source, userid: input.userid ?? null } });
+    return receipt;
   }
 
   setVoiceState(companionId: string, active: boolean): void {
@@ -477,6 +566,35 @@ export class GatewayCore {
     });
   }
 
+  private safePlayerInputId(value: unknown): string | undefined {
+    if (typeof value !== "string") {
+      return undefined;
+    }
+    const safeId = value.replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 128);
+    return safeId || undefined;
+  }
+
+  private publishSafePlayerInput(companionId: string, source: PlayerInput["source"], receipt: PlayerInputReceipt): void {
+    this.publish({
+      type: "player-input",
+      companionId,
+      data: { ...receipt, source },
+    });
+  }
+
+  private safeCommandSummary(command: Command): SafeCommandSummary {
+    return {
+      id: command.id,
+      kind: command.kind,
+      args: command.args,
+      feedback: this.feedbackForCommand(command),
+    };
+  }
+
+  private markFastPlayerCommand(context: CompanionContext, command: Command): void {
+    context.fastPlayerCommandIds.add(command.id);
+  }
+
   interrupt(companionId: string, reason: string): Command {
     const context = this.context(companionId);
     const now = Date.now();
@@ -510,6 +628,16 @@ export class GatewayCore {
     this.store.addAudit(companionId, "interrupted", { reason, epoch: context.epoch });
     this.publish({ type: "interrupt", companionId, data: { reason, epoch: context.epoch } });
     return command;
+  }
+
+  private enqueueFastPlayerCommand(companionId: string, kind: CommandKind, rawArgs: unknown): Command {
+    let context = this.context(companionId);
+    if (this.hasGameplayWork(context)) {
+      const interrupt = this.interrupt(companionId, "player_fast_intent_override");
+      context = this.context(companionId);
+      this.markFastPlayerCommand(context, interrupt);
+    }
+    return this.enqueue(companionId, kind, rawArgs, "player");
   }
 
   enqueue(companionId: string, kind: CommandKind, rawArgs: unknown, priority: CommandPriority, confirmed = false): Command {
@@ -602,6 +730,25 @@ export class GatewayCore {
         output: this.ensurePendingCommandId(this.withCurrentCommandLifecycle(companionId, cached.output, cached.command)),
         command: cached.command,
       });
+    }
+    const context = this.context(companionId);
+    this.expire(context);
+    if (this.hasActiveFastPlayerCommand(context) && NON_STOP_REALTIME_GAMEPLAY_TOOLS.has(name)) {
+      const output = {
+        accepted: false,
+        deferred: true,
+        route: "fast_intent",
+        reason: "A deterministic player command is already pending. Wait for its lifecycle or issue stop first.",
+      };
+      if (cacheKey) {
+        this.realtimeToolResults.set(cacheKey, {
+          name,
+          argsFingerprint,
+          output,
+          expiresAt: Date.now() + TOOL_CALL_CACHE_TTL_MS,
+        });
+      }
+      return Promise.resolve({ output });
     }
 
     return this.runRealtimeTool(companionId, name, rawArgs).then((result) => {
@@ -810,6 +957,7 @@ export class GatewayCore {
         commandWaiters: new Map<string, Set<CommandWaiter>>(),
         pendingTrustedGatherMessages: [],
         trustedGatherSpeechCommandIds: new Set<string>(),
+        fastPlayerCommandIds: new Set<string>(),
         voiceConnected: false,
         voiceSpeaking: false,
         voiceOfflineStandby: true,
@@ -845,6 +993,7 @@ export class GatewayCore {
     for (const [id, record] of context.commandLifecycles) {
       if (this.isTerminalCommandStatus(record.status) && (record.completedAt ?? record.queuedAt) + COMMAND_LIFECYCLE_RETENTION_MS <= now) {
         context.commandLifecycles.delete(id);
+        context.fastPlayerCommandIds.delete(id);
       }
     }
     this.flushTrustedGatherMessages(context);
@@ -888,6 +1037,9 @@ export class GatewayCore {
     }
     if (result && this.isTerminalCommandStatus(status)) {
       record.result = result;
+    }
+    if (this.isTerminalCommandStatus(status)) {
+      context.fastPlayerCommandIds.delete(command.id);
     }
     this.publishCommandLifecycle(context, command.id);
     if (this.isTerminalCommandStatus(status)) {
@@ -1198,6 +1350,13 @@ export class GatewayCore {
     return Boolean(
       (context.active && context.active.command.kind !== "say_in_game")
       || context.queue.some((record) => record.command.kind !== "say_in_game"),
+    );
+  }
+
+  private hasActiveFastPlayerCommand(context: CompanionContext): boolean {
+    return Boolean(
+      (context.active && context.fastPlayerCommandIds.has(context.active.command.id))
+      || context.queue.some((record) => context.fastPlayerCommandIds.has(record.command.id)),
     );
   }
 
