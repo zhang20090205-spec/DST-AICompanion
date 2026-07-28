@@ -512,6 +512,59 @@ export class GatewayCore {
       };
     }
     if (this.controllerMode === "airi") {
+      // Even in AIRI mode, handle recognized fast commands (follow / stop /
+      // gather / approach) locally and instantly, so "!ai 跟着我 / 停下 / 采集"
+      // reliably control the character without depending on the AIRI model
+      // choosing to call tools. The text is still forwarded to AIRI so it can
+      // reply in-character; AIRI just isn't the sole path to action.
+      const airiFastRoute = this.fastIntentRouter.route(normalized, context.state);
+      if (airiFastRoute.status === "matched" && !context.confirmation) {
+        const command = airiFastRoute.intent === "stop"
+          ? this.interrupt(companionId, "player_stop")
+          : this.enqueueFastPlayerCommand(companionId, airiFastRoute.command.kind, airiFastRoute.command.args);
+        this.markFastPlayerCommand(context, command);
+        const receipt: PlayerInputReceipt = {
+          action: airiFastRoute.intent === "stop" ? "interrupted" : "routed",
+          inputId,
+          route: "fast_intent",
+          intent: airiFastRoute.intent,
+          reason: airiFastRoute.reason,
+          command: this.safeCommandSummary(command),
+        };
+        this.publishSafePlayerInput(companionId, input.source, receipt);
+        // Also let AIRI see the utterance for a conversational reply only.
+        this.publish({
+          type: "player-input",
+          companionId,
+          data: { action: "forwarded", inputId, route: "airi", text: normalized, source: input.source, userid: input.userid ?? null },
+        });
+        return receipt;
+      }
+      // Reliably handle follow/stop even when the fast router "blocked" on
+      // transient stale state: forwarding to AIRI is not a dependable path to
+      // action, and follow/stop need no precise targeting (the Lua brain
+      // re-leashes to the player). Gather/approach still require a matched plan.
+      if (!context.confirmation && airiFastRoute.status === "blocked" && (airiFastRoute.intent === "follow" || airiFastRoute.intent === "stop")) {
+        const command = airiFastRoute.intent === "stop"
+          ? this.interrupt(companionId, "player_stop")
+          : this.enqueueFastPlayerCommand(companionId, "follow_player", {});
+        this.markFastPlayerCommand(context, command);
+        const receipt: PlayerInputReceipt = {
+          action: airiFastRoute.intent === "stop" ? "interrupted" : "routed",
+          inputId,
+          route: "fast_intent",
+          intent: airiFastRoute.intent,
+          reason: airiFastRoute.intent === "stop" ? "player_stop" : "player_follow",
+          command: this.safeCommandSummary(command),
+        };
+        this.publishSafePlayerInput(companionId, input.source, receipt);
+        this.publish({
+          type: "player-input",
+          companionId,
+          data: { action: "forwarded", inputId, route: "airi", text: normalized, source: input.source, userid: input.userid ?? null },
+        });
+        return receipt;
+      }
       const receipt: PlayerInputReceipt = { action: "forwarded", inputId, route: "airi" };
       this.publish({
         type: "player-input",

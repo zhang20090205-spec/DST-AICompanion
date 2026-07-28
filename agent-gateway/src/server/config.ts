@@ -8,10 +8,13 @@ export interface GatewayConfig {
   realtimeReasoningEffort: RealtimeReasoningEffort;
   realtimeVoice: string;
   databasePath: string;
+  controllerMode: ControllerMode;
   airiWsUrl: string;
   airiAuthToken?: string;
   airiModuleName: string;
 }
+
+export type ControllerMode = "realtime" | "airi";
 
 export type RealtimeReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -39,6 +42,17 @@ function parseRealtimeReasoningEffort(value: string | undefined): RealtimeReason
     throw new Error("OPENAI_REALTIME_REASONING_EFFORT must be minimal, low, medium, high, or xhigh.");
   }
   return effort as RealtimeReasoningEffort;
+}
+
+function parseControllerMode(value: string | undefined): ControllerMode {
+  // The default experience is the OpenAI Realtime browser voice companion with
+  // the local fast-intent path. Set DST_CONTROLLER_MODE=airi to instead route
+  // control through the optional AIRI desktop app.
+  const mode = value?.trim().toLowerCase() || "realtime";
+  if (mode !== "realtime" && mode !== "airi") {
+    throw new Error("DST_CONTROLLER_MODE must be 'realtime' or 'airi'.");
+  }
+  return mode;
 }
 
 function parseAiriWsUrl(value: string | undefined): string {
@@ -70,6 +84,7 @@ export function loadConfig(env = process.env): GatewayConfig {
     realtimeReasoningEffort: parseRealtimeReasoningEffort(env.OPENAI_REALTIME_REASONING_EFFORT),
     realtimeVoice: env.OPENAI_REALTIME_VOICE?.trim() || "marin",
     databasePath: env.DST_GATEWAY_DATABASE?.trim() || "data/dst-gpt-agent.sqlite",
+    controllerMode: parseControllerMode(env.DST_CONTROLLER_MODE),
     airiWsUrl: parseAiriWsUrl(env.AIRI_WS_URL),
     airiAuthToken: env.AIRI_AUTH_TOKEN?.trim() || undefined,
     airiModuleName: env.AIRI_MODULE_NAME?.trim() || "dst-companion",

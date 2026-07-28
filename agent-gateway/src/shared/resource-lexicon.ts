@@ -105,13 +105,13 @@ export const RESOURCE_LEXICON: ResourceDefinition[] = [
     unit: "块",
     mode: "mine",
     prefabs: ["rock1", "rock2", "rock_flintless", "rock_moon"],
-    tokens: ["岩石", "石头", "石块", "石矿", "矿石", "巨石", "金矿", "rock", "boulder"],
+    tokens: ["岩石", "石头", "石块", "石矿", "矿石", "巨石", "金矿", "矿", "rock", "boulder"],
   },
 ];
 
 // Generic verbs do not force a mode; the resource's default mode is used.
 export const COLLECT_VERBS = [
-  "采集", "收集", "采", "摘", "捡", "拾", "拔", "薅", "收", "gather", "collect", "pick", "harvest",
+  "采集", "收集", "采", "摘", "捡", "拾", "拔", "薅", "割", "收", "gather", "collect", "pick", "harvest",
 ];
 // Explicit work verbs override the resource default mode.
 export const CHOP_VERBS = ["砍", "伐", "劈", "锯", "chop"];

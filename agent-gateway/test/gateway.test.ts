@@ -14,6 +14,7 @@ const config: GatewayConfig = {
   realtimeReasoningEffort: "medium",
   realtimeVoice: "marin",
   databasePath: ":memory:",
+  controllerMode: "realtime",
   airiWsUrl: "ws://127.0.0.1:6121/ws",
   airiAuthToken: "test-token",
   airiModuleName: "dst-companion",
@@ -62,11 +63,16 @@ test("Airi controller mode forwards ordinary game chat without taking the determ
   const events: Array<{ type: string; data: Record<string, unknown> }> = [];
   core.subscribe((event) => events.push({ type: event.type, data: event.data }));
 
-  const receipt = core.receivePlayerInput("bot-1", { text: "跟着我", source: "game" });
+  const receipt = core.receivePlayerInput("bot-1", { text: "你觉得这个基地怎么样", source: "game" });
   assert.equal(receipt.action, "forwarded");
   assert.equal(receipt.route, "airi");
   assert.equal(core.pollCommands("bot-1").commands.length, 0);
   assert.equal(events.some((event) => event.type === "player-input" && event.data.route === "airi"), true);
+  // Recognized commands DO take the deterministic fast path even in AIRI mode,
+  // so control stays reliable without depending on the AIRI model calling tools.
+  const commandReceipt = core.receivePlayerInput("bot-1", { text: "跟着我", source: "game" });
+  assert.equal(commandReceipt.action, "routed");
+  assert.equal(commandReceipt.intent, "follow");
   store.close();
 });
 

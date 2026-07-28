@@ -8,7 +8,7 @@ import {
 } from "../shared/resource-lexicon.js";
 import { MAX_FOLLOW_DISTANCE, MAX_MOVEMENT_DISTANCE, hasFreshState, isGatherTargetAvailable } from "./validation.js";
 
-export type FastIntentName = "stop" | "follow" | "approach" | "gather_resource";
+export type FastIntentName = "stop" | "follow" | "approach" | "gather_resource" | "attack" | "give_item" | "equip_or_eat";
 export type FastIntentBlockReason = "stale_state" | "ambiguous_intent" | "target_unavailable";
 
 export interface FastIntentCommandPlan {
@@ -38,6 +38,8 @@ interface FastIntentTextCandidate {
   resource?: ResourceDefinition;
   mode?: GatherMode;
   scope?: GatherScope;
+  itemPrefab?: string;
+  equipAction?: "equip" | "eat";
 }
 
 type FastIntentTextAnalysis =
@@ -56,18 +58,53 @@ const HIGH_RISK_TEXT = /攻击|打(?:一下|死)?|杀|喂|吃|装备|穿|丢|dro
 const STOP_PATTERNS = [
   /\b(?:stop|cancel|halt)\b/i,
   /\b(?:wait there|wait here|hold position|hold still)\b/i,
-  /停止|停下|停一停|停一下|先停|别动|不要动|站住|别跟|不要跟|不跟了/u,
+  /停(?:止|下来?|一下|一停|手|停)?|别动|不要动|站住|别走了?|别乱跑|慢着|且慢|别跟|不要跟|不跟了/u,
   /(?:别|不要|不用)(?:再)?(?:采|采集|收集|捡|拾|摘|拿|砍|挖)/u,
   /\bstop\s+(?:gathering|collecting|picking|chopping|mining)\b/i,
 ];
 const FOLLOW_PATTERNS = [
-  /跟着我|跟随我|跟我|跟上|跟紧|随我/u,
+  /过来跟(?:着)?我?|跟着(?:我|点|走|过来|好)?|跟过来|跟随我?|跟我|跟上|跟紧|跟好|跟住|随我/u,
   /\bfollow(?:\s+me)?\b/i,
 ];
 const APPROACH_PATTERNS = [
-  /靠近我|靠过来|来我这里|来我这|到我这里|到我这|过来/u,
+  /靠近我|靠过来|来我这里?|来我身边|到我这里?|到我身边|我身边|我这边|上前来?|过来/u,
   /\b(?:come here|come to me|approach me)\b/i,
 ];
+// Attack targets the nearest hostile automatically (no target arg needed); the
+// Lua brain only engages actual threats.
+const ATTACK_PATTERNS = [
+  /攻击|揍|打(?:死|倒|怪|跑|退|败|它|他|她|那|这)|杀(?:死|掉|了)?|干掉|干死|收拾|消灭|反击|保护我/u,
+  /\b(?:attack|kill|fight|defend me)\b/i,
+];
+const GIVE_PATTERNS = [
+  /给我|给你|丢给我|递给我|拿给我|扔给我/u,
+  /\b(?:give (?:me|it)|hand (?:me|over)|drop it)\b/i,
+];
+const EAT_PATTERNS = [/吃(?:掉|一口|点|个)?|恰/u, /\beat\b/i];
+const EQUIP_PATTERNS = [/装备|装上|穿上|穿好|拿起|举起|握住/u, /\b(?:equip|wear|hold)\b/i];
+
+// Compact inventory-item lexicon for give / equip / eat. Longest word wins.
+const ITEM_LEXICON: { prefab: string; words: string[] }[] = [
+  { prefab: "torch", words: ["火把", "火炬", "torch"] },
+  { prefab: "cookedmeat", words: ["熟肉", "烤肉", "cooked meat"] },
+  { prefab: "meat", words: ["生肉", "肉", "meat"] },
+  { prefab: "log", words: ["木头", "原木", "木材", "log"] },
+  { prefab: "twigs", words: ["树枝", "小树枝", "twigs"] },
+  { prefab: "cutgrass", words: ["干草", "割下的草", "cut grass"] },
+  { prefab: "flint", words: ["燧石", "火石", "flint"] },
+  { prefab: "rocks", words: ["石头", "岩石", "石块", "rocks", "rock"] },
+  { prefab: "goldnugget", words: ["金块", "金子", "黄金", "gold"] },
+  { prefab: "berries", words: ["浆果", "莓果", "berries"] },
+  { prefab: "carrot", words: ["胡萝卜", "萝卜", "carrot"] },
+  { prefab: "axe", words: ["斧头", "斧子", "axe"] },
+  { prefab: "pickaxe", words: ["十字镐", "镐", "pickaxe"] },
+  { prefab: "spear", words: ["长矛", "矛", "spear"] },
+  { prefab: "footballhat", words: ["猪皮帽", "足球帽", "football helmet"] },
+  { prefab: "armorwood", words: ["木甲", "木质护甲", "log suit"] },
+];
+const ITEM_WORDS: { prefab: string; word: string }[] = ITEM_LEXICON
+  .flatMap((entry) => entry.words.map((word) => ({ prefab: entry.prefab, word: word.toLowerCase() })))
+  .sort((a, b) => b.word.length - a.word.length);
 
 export class FastIntentRouter {
   route(rawText: string, state: CompanionState | undefined, now = Date.now()): FastIntentResult {
@@ -142,6 +179,53 @@ export class FastIntentRouter {
       );
     }
 
+    if (textRoute.candidate.intent === "attack") {
+      if (!hasFreshState(state, now)) {
+        return { status: "blocked", intent: "attack", reason: "stale_state" };
+      }
+      // No target arg: the Lua brain engages the nearest actual hostile only.
+      return {
+        status: "matched",
+        intent: "attack",
+        reason: "attack_threat",
+        command: { kind: "attack_nearby_threat", args: {} },
+        ...(residualText ? { residualText } : {}),
+      };
+    }
+
+    if (textRoute.candidate.intent === "give_item" && textRoute.candidate.itemPrefab) {
+      if (!hasFreshState(state, now)) {
+        return { status: "blocked", intent: "give_item", reason: "stale_state" };
+      }
+      if (!state.player.guid || state.player.distance === null || state.player.distance > MAX_MOVEMENT_DISTANCE) {
+        return { status: "blocked", intent: "give_item", reason: "target_unavailable" };
+      }
+      return {
+        status: "matched",
+        intent: "give_item",
+        reason: "give_item",
+        command: { kind: "give_item", args: { itemName: textRoute.candidate.itemPrefab, quantity: 1 } },
+        ...(residualText ? { residualText } : {}),
+      };
+    }
+
+    if (textRoute.candidate.intent === "equip_or_eat" && textRoute.candidate.itemPrefab && textRoute.candidate.equipAction) {
+      if (!hasFreshState(state, now)) {
+        return { status: "blocked", intent: "equip_or_eat", reason: "stale_state" };
+      }
+      const itemPrefab = textRoute.candidate.itemPrefab;
+      if (!state.inventory.some((item) => item.prefab.toLowerCase() === itemPrefab)) {
+        return { status: "blocked", intent: "equip_or_eat", reason: "target_unavailable" };
+      }
+      return {
+        status: "matched",
+        intent: "equip_or_eat",
+        reason: textRoute.candidate.equipAction === "eat" ? "eat_item" : "equip_item",
+        command: { kind: "equip_or_eat", args: { action: textRoute.candidate.equipAction, itemName: itemPrefab } },
+        ...(residualText ? { residualText } : {}),
+      };
+    }
+
     return { status: "none" };
   }
 }
@@ -152,6 +236,9 @@ function analyzeIntentText(rawText: string, normalizedText: string): FastIntentT
   addCandidate(candidates, stop);
   addCandidate(candidates, findFollowCandidate(rawText, normalizedText));
   addCandidate(candidates, findApproachCandidate(rawText, normalizedText));
+  addCandidate(candidates, findAttackCandidate(rawText, normalizedText));
+  addCandidate(candidates, findGiveCandidate(rawText, normalizedText));
+  addCandidate(candidates, findEquipEatCandidate(rawText, normalizedText));
   const gather = findGatherCandidate(rawText, normalizedText);
   if (gather.status === "blocked" && !(stop && isGatherStopIntent(normalizedText))) {
     return gather;
@@ -220,11 +307,59 @@ function findFollowCandidate(rawText: string, normalizedText: string): FastInten
 }
 
 function findApproachCandidate(rawText: string, normalizedText: string): FastIntentTextCandidate | undefined {
-  if (!isApproachIntent(normalizedText)) {
+  if (!isApproachIntent(normalizedText) || isFollowIntent(normalizedText)) {
+    // "过来跟着我" / "跟过来" mean follow; let follow win over a bare approach.
     return undefined;
   }
   const span = firstPatternSpan(rawText, APPROACH_PATTERNS);
   return span ? { intent: "approach", span } : undefined;
+}
+
+function findItemMatch(rawText: string): { prefab: string; span: TextSpan } | undefined {
+  const lower = rawText.toLowerCase();
+  for (const { prefab, word } of ITEM_WORDS) {
+    const index = lower.indexOf(word);
+    if (index >= 0) {
+      return { prefab, span: { start: index, end: index + word.length } };
+    }
+  }
+  return undefined;
+}
+
+function findAttackCandidate(rawText: string, _normalizedText: string): FastIntentTextCandidate | undefined {
+  const span = firstPatternSpan(rawText, ATTACK_PATTERNS);
+  return span ? { intent: "attack", span } : undefined;
+}
+
+function findGiveCandidate(rawText: string, _normalizedText: string): FastIntentTextCandidate | undefined {
+  const verb = firstPatternSpan(rawText, GIVE_PATTERNS);
+  if (!verb) {
+    return undefined;
+  }
+  const item = findItemMatch(rawText);
+  if (!item) {
+    return undefined;
+  }
+  return { intent: "give_item", span: coveringSpan([verb, item.span]), itemPrefab: item.prefab };
+}
+
+function findEquipEatCandidate(rawText: string, _normalizedText: string): FastIntentTextCandidate | undefined {
+  const eatSpan = firstPatternSpan(rawText, EAT_PATTERNS);
+  const equipSpan = firstPatternSpan(rawText, EQUIP_PATTERNS);
+  const verb = eatSpan ?? equipSpan;
+  if (!verb) {
+    return undefined;
+  }
+  const item = findItemMatch(rawText);
+  if (!item) {
+    return undefined;
+  }
+  return {
+    intent: "equip_or_eat",
+    span: coveringSpan([verb, item.span]),
+    itemPrefab: item.prefab,
+    equipAction: eatSpan ? "eat" : "equip",
+  };
 }
 
 function findGatherCandidate(
@@ -285,12 +420,12 @@ function normalizeResidualText(value: string): string {
 }
 
 function isStopIntent(text: string): boolean {
-  if (/别停|不要停|不用停/.test(text)) {
+  if (/别停|不要停|不用停|不停/.test(text)) {
     return false;
   }
   return /(^|\s)(stop|cancel|halt)(\s|$)/.test(text)
     || /(^|\s)(?:wait there|wait here|hold position|hold still)(\s|$)/.test(text)
-    || /停止|停下|停一停|停一下|先停|别动|不要动|站住|别跟|不要跟|不跟了/.test(text)
+    || /停(?:止|下来?|一下|一停|手|停)?|别动|不要动|站住|别走|别乱跑|慢着|且慢|别跟|不跟了/.test(text)
     || /(?:别|不要|不用)(?:再)?(?:采|采集|收集|捡|拾|摘|拿|砍|挖)/.test(text)
     || /(^|\s)stop (?:gathering|collecting|picking|chopping|mining)(\s|$)/.test(text);
 }
@@ -299,12 +434,12 @@ function isFollowIntent(text: string): boolean {
   if (/别跟|不要跟|不用跟|不跟/.test(text)) {
     return false;
   }
-  return /跟着我|跟随我|跟我|跟上|跟紧|随我/.test(text)
+  return /跟着(?:我|点|走|过来|好)?|跟过来|跟随我?|跟我|跟上|跟紧|跟好|跟住|随我/.test(text)
     || /(^|\s)follow(?: me)?(\s|$)/.test(text);
 }
 
 function isApproachIntent(text: string): boolean {
-  return /过来|靠近我|靠过来|来我这|来我这里|到我这|到我这里/.test(text)
+  return /过来|靠近我|靠过来|来我这里?|来我身边|到我这里?|到我身边|我身边|我这边|上前来?/.test(text)
     || /(^|\s)(come here|come to me|approach me)(\s|$)/.test(text);
 }
 

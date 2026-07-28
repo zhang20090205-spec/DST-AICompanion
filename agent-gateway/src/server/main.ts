@@ -18,8 +18,11 @@ if (process.env.HTTPS_PROXY || process.env.HTTP_PROXY || process.env.https_proxy
 const config = loadConfig();
 const store = new GatewayStore(config.databasePath);
 const core = new GatewayCore(store);
-const airi = new AiriBridge(config, core);
-const app = createGatewayApp(config, core, () => airi.status());
+// AIRI is an optional controller. In the default "realtime" mode we leave the
+// core in its native realtime state (browser Realtime voice + local fast path);
+// only "airi" mode constructs and starts the WebSocket bridge to the AIRI app.
+const airi = config.controllerMode === "airi" ? new AiriBridge(config, core) : undefined;
+const app = createGatewayApp(config, core, airi ? () => airi.status() : undefined);
 
 const timer = setInterval(() => {
   core.runAutonomy();
@@ -29,7 +32,7 @@ timer.unref();
 
 const shutdown = async () => {
   clearInterval(timer);
-  airi.stop();
+  airi?.stop();
   await app.close();
   store.close();
 };
@@ -38,5 +41,5 @@ process.once("SIGINT", () => void shutdown().then(() => process.exit(0)));
 process.once("SIGTERM", () => void shutdown().then(() => process.exit(0)));
 
 await app.listen({ host: config.host, port: config.port });
-airi.start();
-console.log(`DST Airi Agent Gateway listening at http://${config.host}:${config.port}`);
+airi?.start();
+console.log(`DST Agent Gateway listening at http://${config.host}:${config.port} (controller: ${config.controllerMode})`);

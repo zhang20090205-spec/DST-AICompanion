@@ -132,6 +132,10 @@ export const SYSTEM_INSTRUCTIONS = [
   "只有高风险动作才可调用 request_confirmation：攻击非敌对对象、消耗稀有物品或给予稀有物品。采集、跟随和靠近绝不能调用 request_confirmation。",
   "自主行为每次最多做一个低风险动作，除非危险或需要确认，否则保持安静。",
   "当浏览器送来可信终态时，只按该终态和反馈策略决定是否语音回应：普通成功通常不再回应；failed、partial、非玩家取消或 always_result 策略才回应。玩家、VAD 或 stop 导致的取消保持安静。",
+  "当玩家的话表达了游戏内意图、但没有被 Gateway 快速路由处理（你收到需要你决定的转发）时，你必须真正调用对应的动作工具去执行，而不是只用语音闲聊敷衍；能用工具达成的就调用工具，行动优先于解释。",
+  "遇到复杂、多步或带条件的请求（例如“如果附近有怪就先打、否则去采浆果”“血量低就吃点东西”“帮我囤点柴火”），先调用 get_game_state 读取真实状态并据此推理，再按顺序调用相应工具；每个动作仍遵守前言与终态回执规则。",
+  "把多步请求拆成依次的工具调用：完成并收到一个动作的终态回执后，再进行下一个动作，不要一次并发多个动作工具。",
+  "攻击时若未指定目标，attack_nearby_threat 会自动选择最近的敌对生物；只有攻击非敌对对象才需要 request_confirmation。装备或进食前可先 get_game_state 查看背包里的物品 prefab 名，itemName 用该 prefab。",
 ].join("\n");
 
 export const REALTIME_TOOLS = [
@@ -207,7 +211,7 @@ export const REALTIME_TOOLS = [
   {
     type: "function",
     name: "attack_nearby_threat",
-    description: "Attack a nearby hostile threat only.",
+    description: "Low-risk defense: attack the nearest hostile threat. Omit targetGuid to let the companion auto-select the nearest hostile from the latest observation. Only attacking a NON-hostile needs request_confirmation. Say at most one short browser-audio-only preamble before calling; never claim completion before command-result.",
     parameters: {
       type: "object",
       properties: { targetGuid: { type: "number" } },
@@ -217,7 +221,7 @@ export const REALTIME_TOOLS = [
   {
     type: "function",
     name: "equip_or_eat",
-    description: "Equip a suitable item or eat ordinary food.",
+    description: "Equip a suitable item or eat ordinary food from the companion's inventory. itemName must be an inventory item prefab — call get_game_state first to read exact prefab names. Consuming a rare item needs request_confirmation. Short browser-audio-only preamble before calling; wait for command-result.",
     parameters: {
       type: "object",
       properties: {
@@ -230,7 +234,7 @@ export const REALTIME_TOOLS = [
   {
     type: "function",
     name: "give_item",
-    description: "Give a nearby player a non-rare item from inventory.",
+    description: "Give the nearby player a non-rare item from the companion's inventory. itemName is an inventory prefab (get_game_state to confirm); the player must be near. Giving a rare item needs request_confirmation. Short browser-audio-only preamble before calling; wait for command-result.",
     parameters: {
       type: "object",
       properties: { itemName: { type: "string" }, quantity: { type: "number", minimum: 1, maximum: 40 } },

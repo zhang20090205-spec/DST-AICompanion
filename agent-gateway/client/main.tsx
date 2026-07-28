@@ -1,11 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { Activity, CircleAlert, Loader, Wifi, WifiOff } from "lucide-react";
+import { Activity, CircleAlert, Loader, Mic, MicOff, Wifi, WifiOff } from "lucide-react";
+import { RealtimeBridge, type ConnectionStatus, type RealtimeConnectionDiagnostic, type TranscriptEntry } from "./realtime";
 import "./styles.css";
 
-// The dashboard is intentionally decoupled from ./realtime (the dormant
-// OpenAI Realtime bridge). It never requests a microphone and never speaks to
-// OpenAI — it only reads gateway status over the loopback HTTP + SSE API.
+// The status dashboard reads gateway state over loopback HTTP + SSE. In the
+// default "realtime" controller mode it also hosts the OpenAI Realtime voice
+// companion (microphone + speech-to-speech) via the RealtimeBridge below; the
+// bridge owns the OpenAI connection and feeds gateway events back into the same
+// handler the SSE stream uses.
 interface GatewayEvent {
   type: string;
   companionId?: string;
@@ -138,7 +141,14 @@ function App() {
   const [sseConnected, setSseConnected] = useState(false);
   const [notice, setNotice] = useState("");
 
+  const [voiceStatus, setVoiceStatus] = useState<ConnectionStatus>("disconnected");
+  const [voiceDetail, setVoiceDetail] = useState("");
+  const [transcript, setTranscript] = useState<TranscriptEntry[]>([]);
+  const [voiceDiag, setVoiceDiag] = useState<RealtimeConnectionDiagnostic | null>(null);
+
   const recentSeq = useRef(0);
+  const bridgeRef = useRef<RealtimeBridge | null>(null);
+  const handleEventRef = useRef<(event: GatewayEvent) => void>(() => {});
 
   const addRecent = (label: string, tone: RecentResult["tone"]) => {
     recentSeq.current += 1;
@@ -422,6 +432,49 @@ function App() {
     };
   }, []);
 
+  // Keep the bridge's event handler pointing at the latest render's closure,
+  // and tear the voice session down on unmount.
+  useEffect(() => {
+    handleEventRef.current = handleGatewayEvent;
+  });
+  useEffect(() => () => { void bridgeRef.current?.disconnect(); }, []);
+
+  const ensureBridge = () => {
+    if (!bridgeRef.current) {
+      bridgeRef.current = new RealtimeBridge({
+        onStatus: (status, detail) => { setVoiceStatus(status); setVoiceDetail(detail ?? ""); },
+        onTranscript: (entry) => setTranscript((current) => {
+          const index = current.findIndex((item) => item.id === entry.id);
+          if (index >= 0) {
+            const next = current.slice();
+            next[index] = entry;
+            return next;
+          }
+          return [...current, entry].slice(-50);
+        }),
+        onGatewayEvent: (event) => handleEventRef.current(event),
+        onDiagnostic: (diagnostic) => setVoiceDiag(diagnostic),
+      }, COMPANION_ID);
+    }
+    return bridgeRef.current;
+  };
+
+  const toggleVoice = () => {
+    const bridge = ensureBridge();
+    if (voiceStatus === "connected" || voiceStatus === "connecting") {
+      void bridge.disconnect("用户断开语音");
+    } else {
+      setVoiceDiag(null);
+      void bridge.connect().catch((error) => {
+        setVoiceStatus("error");
+        setVoiceDetail(error instanceof Error ? error.message : String(error));
+      });
+    }
+  };
+
+  const voiceConnected = voiceStatus === "connected";
+  const voiceConnecting = voiceStatus === "connecting";
+
   const airiIndicator = useMemo(() => {
     if (airi.connected && airi.authenticated) return "online";
     if (airi.connected) return "pending";
@@ -445,6 +498,33 @@ function App() {
       </header>
 
       {notice && <div className="notice"><CircleAlert size={16} /><span>{notice}</span></div>}
+
+      <section className={`panel voice ${voiceStatus}`} aria-label="语音伙伴">
+        <div className="voice-head">
+          <h2>语音伙伴 · OpenAI Realtime</h2>
+          <button className={`voice-btn ${voiceStatus}`} onClick={toggleVoice} disabled={voiceConnecting}>
+            {voiceConnecting ? <Loader size={15} className="spin" /> : (voiceConnected ? <Mic size={15} /> : <MicOff size={15} />)}
+            {voiceConnected ? "断开语音" : voiceConnecting ? "连接中…" : "连接语音"}
+          </button>
+        </div>
+        <p className="voice-status">
+          {voiceConnected ? "已连接，直接说话即可；说“停下/停止”可立即打断当前动作。"
+            : voiceConnecting ? "正在建立 Realtime 语音连接…"
+            : voiceStatus === "error" ? `语音连接出错：${voiceDetail || "未知错误"}`
+            : "点击“连接语音”，允许麦克风后即可用自然语言对话并指挥角色。"}
+        </p>
+        {voiceDiag && <p className={`voice-diag ${voiceDiag.recoverable ? "" : "fatal"}`}>{voiceDiag.detail}</p>}
+        {transcript.length > 0 && (
+          <ul className="transcript">
+            {transcript.map((entry) => (
+              <li key={entry.id} className={entry.role}>
+                <span className="who">{entry.role === "assistant" ? "AI" : entry.role === "player" ? "你" : "系统"}</span>
+                {entry.text}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
 
       <section className="dashboard" aria-label="游戏状态">
         <div className="metric"><span>生命</span><strong>{game.health ?? "--"}</strong></div>

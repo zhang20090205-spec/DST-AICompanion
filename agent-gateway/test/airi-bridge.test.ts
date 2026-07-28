@@ -51,6 +51,7 @@ test("Airi bridge authenticates, announces, forwards input, and fails closed on 
     realtimeReasoningEffort: "low",
     realtimeVoice: "marin",
     databasePath: ":memory:",
+    controllerMode: "airi",
     airiWsUrl: `ws://127.0.0.1:${port}/ws`,
     airiAuthToken: "secret",
     airiModuleName: "dst-companion",
